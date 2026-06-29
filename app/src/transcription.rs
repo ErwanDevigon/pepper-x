@@ -1446,9 +1446,12 @@ fn describe_asr_error(error: &TranscriptionError) -> String {
         TranscriptionError::DecodeFailed(path) => {
             format!("failed to decode {}", path.display())
         }
+        // New error variant for multilingual support
+        TranscriptionError::LanguageConfigFailed(msg) => {
+            format!("language configuration failed: {}", msg)
+        }
     }
 }
-
 fn configured_model_dir() -> Result<PathBuf, TranscriptionRunError> {
     match std::env::var_os("PEPPERX_PARAKEET_MODEL_DIR") {
         Some(value) if !value.is_empty() => return Ok(PathBuf::from(value)),

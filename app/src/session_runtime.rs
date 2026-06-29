@@ -34,9 +34,7 @@ struct StreamingHandle {
 }
 
 /// Spawn a background thread that creates a [`pepperx_asr::StreamingTranscriber`],
-/// reads audio chunks from `chunk_rx`, and feeds them in real-time.  When the
-/// channel is closed (sender dropped), the thread flushes remaining audio and
-/// sends the final transcript through `result_tx`.
+/// reads audio chunks from `chunk_rx`, and feeds them in real-time.
 fn spawn_streaming_transcriber(
     model_dir: std::path::PathBuf,
     model_name: String,
@@ -46,7 +44,11 @@ fn spawn_streaming_transcriber(
 
     let builder = std::thread::Builder::new().name("pepperx-streaming-asr".into());
     match builder.spawn(move || {
-        let mut transcriber = match pepperx_asr::StreamingTranscriber::new(&model_dir) {
+        // Use French by default (new multilingual model). 
+        // TODO: make target language configurable from AppSettings.
+        let target_lang: Option<&str> = Some("fr-FR");
+
+        let mut transcriber = match pepperx_asr::StreamingTranscriber::new(&model_dir, target_lang) {
             Ok(t) => t,
             Err(error) => {
                 eprintln!(
@@ -68,7 +70,7 @@ fn spawn_streaming_transcriber(
             }
         }
 
-        // Channel closed — recording stopped.  Flush remaining samples.
+        // Channel closed — recording stopped. Flush remaining samples.
         match transcriber.flush() {
             Ok(transcript_text) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
