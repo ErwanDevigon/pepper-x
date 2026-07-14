@@ -22,7 +22,7 @@ pub struct SetupChecklist {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelBootstrapSummary {
-    pub asr_ready: bool,
+    pub sr_ready: bool,
     pub cleanup_ready: bool,
     pub progress_label: String,
     pub failure_message: Option<String>,
@@ -373,3 +373,6 @@ pub fn initial_surface(
         },
     }
 }
+
+
+

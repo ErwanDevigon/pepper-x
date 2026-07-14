@@ -101,6 +101,7 @@ impl Default for AppSettings {
             preferred_cleanup_model: default_model(ModelKind::Cleanup).id.into(),
             cleanup_prompt_profile: DEFAULT_CLEANUP_PROMPT_PROFILE.into(),
             cleanup_custom_prompt: String::new(),
+            cleanup_use_gpu: false,
             play_sounds: true,
             enable_window_context: false,
             hold_trigger_keys: default_hold_trigger_keys(),
@@ -958,3 +959,5 @@ mod tests {
         let _ = std::fs::remove_dir_all(state_root);
     }
 }
+
+
