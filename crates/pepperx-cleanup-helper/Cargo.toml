@@ -11,11 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 pepperx-platform = { path = "../pepperx-platform" }
-# GPU backends for llama.cpp:
-#   cuda — NVIDIA GPUs (requires CUDA toolkit)
-# Vulkan is disabled: build needs `glslc` (shaderc / Vulkan SDK).
-# To re-enable for AMD/Intel GPUs, install glslc then add "vulkan" to both
-# llama-cpp-4 and llama-cpp-sys-4 features below.
+# GPU backends for llama.cpp (see README.md § "GPU acceleration for cleanup"):
+#   cuda   — NVIDIA GPUs; requires CUDA toolkit at build time (nvcc, libcudart)
+#   vulkan — AMD/Intel; disabled here (needs glslc from shaderc / Vulkan SDK).
+#            Install glslc, then add "vulkan" to both llama-cpp-4 and llama-cpp-sys-4.
+# CPU-only: remove "cuda" from both feature lists below.
 llama-cpp-4 = { version = "0.3.2", default-features = false, features = ["native", "cuda"] }
 llama-cpp-sys-4 = { version = "0.3.2", default-features = false, features = ["native", "cuda"] }
 num_cpus = "1.16"
