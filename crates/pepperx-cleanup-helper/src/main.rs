@@ -97,8 +97,16 @@ impl ModelSlot {
         model_path: &PathBuf,
         n_threads: i32,
     ) -> Option<Self> {
-        let model_params = LlamaModelParams::default();
-        let model_params = std::pin::pin!(model_params);
+        let use_gpu = std::env::var("PEPPER_CLEANUP_GPU")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let mut model_params = LlamaModelParams::default();
+        if use_gpu {
+            model_params = model_params.with_n_gpu_layers(99);
+            eprintln!("🍋 Pepper-X Cleanup → Model loaded with GPU offload (99 layers)");
+        }
+
         match LlamaModel::load_from_file(backend, model_path, &model_params) {
             Ok(model) => {
                 eprintln!(
@@ -268,11 +276,23 @@ fn handle_request(
 // ---------------------------------------------------------------------------
 
 fn make_ctx_params(n_threads: i32) -> LlamaContextParams {
-    LlamaContextParams::default()
+    let use_gpu = std::env::var("PEPPER_CLEANUP_GPU")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    let mut params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(SESSION_CTX))
         .with_n_batch(BATCH_SIZE)
         .with_n_threads(n_threads)
-        .with_n_threads_batch(n_threads)
+        .with_n_threads_batch(n_threads);
+
+    if use_gpu {
+        eprintln!("🍋 Pepper-X Cleanup → GPU activated");
+    } else {
+        eprintln!("🍋 Pepper-X Cleanup → CPU mode only");
+    }
+
+    params
 }
 
 /// Create a fresh `LlamaContext`, returning a `HelperResponse` error on failure.
