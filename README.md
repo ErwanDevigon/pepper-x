@@ -21,7 +21,7 @@ record=3.2s  transcribe=0.0s  cleanup=0.5s  insert=0.2s  total=0.7s
 
 Transcription happens during recording (streaming). Cleanup uses a pre-warmed KV cache.
 
-With an NVIDIA GPU and CUDA enabled, cleanup is near real-time (typically sub-second instead of several seconds on CPU).
+With an NVIDIA GPU and CUDA enabled, cleanup is typically ~0.1s instead of several seconds on some CPUs.
 
 ## Install
 
@@ -48,7 +48,7 @@ sudo dnf install \
 
 #### GPU acceleration for cleanup (optional, NVIDIA)
 
-`pepperx-cleanup-helper` is built with CUDA support by default. This offloads the Qwen cleanup model to an NVIDIA GPU and makes cleanup much faster.
+`pepperx-cleanup-helper` is built with optional GPU acceleration. CUDA support by default. This offloads the Qwen cleanup model to an NVIDIA GPU and makes cleanup much faster.
 
 **System dependencies:**
 
