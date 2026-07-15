@@ -26,3 +26,4 @@ gnome-extension/.build/
 .continue/
 .vscode/
 *.bak*
+AGENTS.md
