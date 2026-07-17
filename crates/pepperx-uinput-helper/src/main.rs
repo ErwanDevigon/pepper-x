@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::io::{BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use xkbcommon::xkb;
 
@@ -14,7 +15,10 @@ const STARTUP_DELAY: Duration = Duration::from_millis(250);
 const KEY_HOLD_DELAY: Duration = Duration::from_millis(2);
 const INTER_KEY_DELAY: Duration = Duration::from_millis(1);
 const DEAD_KEY_DELAY: Duration = Duration::from_millis(8);
-const UNICODE_MODE_DELAY: Duration = Duration::from_millis(30);
+/// GTK/IBus needs a beat after Ctrl+Shift+U before hex digits are accepted.
+const UNICODE_MODE_DELAY: Duration = Duration::from_millis(80);
+/// Let the focused app read clipboard contents before we restore the previous value.
+const CLIPBOARD_PASTE_DELAY: Duration = Duration::from_millis(80);
 
 /// Evdev keycodes start at 8 below XKB keycodes (XKB keycode = evdev keycode + 8).
 const XKB_EVDEV_OFFSET: u32 = 8;
@@ -81,14 +85,17 @@ fn run() -> Result<(), String> {
         )
     })?;
 
-    let mapper = build_char_mapper_from_env()?;
-    let mut device = create_virtual_keyboard(&mapper)?;
+    // Build from the layout that is actually active right now (not the first listed source).
+    // Virtual device keycaps are layout-agnostic (full alphanumeric + modifiers), so we
+    // can rebuild only the char→chord map when the user switches layouts mid-session.
+    let mut session = LayoutSession::open()?;
+    let mut device = create_virtual_keyboard(&session.mapper)?;
 
     loop {
         let (stream, _) = listener
             .accept()
             .map_err(|error| format!("failed to accept helper connection: {error}"))?;
-        handle_connection(stream, &mut device, &mapper)?;
+        handle_connection(stream, &mut device, &mut session)?;
     }
 }
 
@@ -105,14 +112,301 @@ fn configured_socket_path() -> Result<PathBuf, String> {
 }
 
 // ---------------------------------------------------------------------------
-// XKB keymap → character mapping (direct + AltGr + dead keys)
+// Active layout detection + XKB keymap → character mapping
 // ---------------------------------------------------------------------------
 
-fn build_char_mapper_from_env() -> Result<CharMapper, String> {
-    let layout_raw = std::env::var("PEPPERX_XKB_LAYOUT").unwrap_or_else(|_| detect_layout());
-    let variant_env = std::env::var("PEPPERX_XKB_VARIANT").unwrap_or_default();
-    let (layout, variant) = split_layout_variant(&layout_raw, &variant_env);
-    build_char_mapper(layout, variant)
+/// Identifies an XKB layout/variant pair used to compile a reverse key map.
+///
+/// uinput injects *keycodes*, and the compositor re-interprets them through
+/// the currently selected input source. Our reverse map must therefore match
+/// the *active* source at insert time, not the first entry in `sources`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LayoutId {
+    layout: String,
+    variant: String,
+}
+
+impl LayoutId {
+    fn new(layout: impl Into<String>, variant: impl Into<String>) -> Self {
+        Self {
+            layout: layout.into(),
+            variant: variant.into(),
+        }
+    }
+
+    fn display(&self) -> String {
+        if self.variant.is_empty() {
+            self.layout.clone()
+        } else {
+            format!("{}+{}", self.layout, self.variant)
+        }
+    }
+}
+
+/// Cached reverse map for the layout that was active at last refresh.
+struct LayoutSession {
+    id: LayoutId,
+    mapper: CharMapper,
+    /// How the layout was resolved (for logs).
+    source: String,
+}
+
+impl LayoutSession {
+    fn open() -> Result<Self, String> {
+        let (id, source) = resolve_active_layout();
+        let mapper = build_char_mapper(&id.layout, &id.variant)?;
+        eprintln!(
+            "[Pepper X uinput] active layout '{}' (source={source})",
+            id.display()
+        );
+        Ok(Self { id, mapper, source })
+    }
+
+    /// Re-probe the active layout. Rebuild the mapper only when it changed.
+    fn refresh_if_needed(&mut self) -> Result<(), String> {
+        let (id, source) = resolve_active_layout();
+        if id == self.id {
+            return Ok(());
+        }
+        eprintln!(
+            "[Pepper X uinput] layout switched '{}' → '{}' (source={source})",
+            self.id.display(),
+            id.display()
+        );
+        let mapper = build_char_mapper(&id.layout, &id.variant)?;
+        self.id = id;
+        self.mapper = mapper;
+        self.source = source;
+        Ok(())
+    }
+}
+
+/// Resolve layout: env override → GNOME active source → setxkbmap → /etc → us.
+fn resolve_active_layout() -> (LayoutId, String) {
+    if let Ok(layout_raw) = std::env::var("PEPPERX_XKB_LAYOUT") {
+        if !layout_raw.is_empty() {
+            let variant_env = std::env::var("PEPPERX_XKB_VARIANT").unwrap_or_default();
+            let (layout, variant) = split_layout_variant(&layout_raw, &variant_env);
+            return (
+                LayoutId::new(layout, variant),
+                "env:PEPPERX_XKB_LAYOUT".into(),
+            );
+        }
+    }
+
+    if let Some(id) = detect_gnome_active_layout() {
+        return (id, "gsettings:active".into());
+    }
+
+    if let Some(id) = detect_setxkbmap_layout() {
+        return (id, "setxkbmap".into());
+    }
+
+    if let Some(id) = detect_etc_default_keyboard() {
+        return (id, "/etc/default/keyboard".into());
+    }
+
+    eprintln!("[Pepper X uinput] no layout detected, defaulting to 'us'");
+    (LayoutId::new("us", ""), "default".into())
+}
+
+/// GNOME: prefer `mru-sources[0]` (currently active), else `sources[current]`.
+fn detect_gnome_active_layout() -> Option<LayoutId> {
+    // mru-sources[0] is the live selection after Super+Space switches.
+    if let Some(raw) = gsettings_get("org.gnome.desktop.input-sources", "mru-sources") {
+        let entries = parse_gsettings_input_sources(&raw);
+        if let Some(id) = first_xkb_entry(&entries) {
+            eprintln!(
+                "[Pepper X uinput] detected active layout from mru-sources: {}",
+                id.display()
+            );
+            return Some(id);
+        }
+    }
+
+    // Fallback: sources[current]
+    let sources_raw = gsettings_get("org.gnome.desktop.input-sources", "sources")?;
+    let entries = parse_gsettings_input_sources(&sources_raw);
+    if entries.is_empty() {
+        return None;
+    }
+
+    let index = gsettings_get("org.gnome.desktop.input-sources", "current")
+        .and_then(|s| parse_gsettings_uint32(&s))
+        .unwrap_or(0) as usize;
+
+    let chosen = entries
+        .get(index)
+        .or_else(|| entries.first())
+        .cloned()?;
+
+    if chosen.0 != "xkb" {
+        eprintln!(
+            "[Pepper X uinput] active input source is '{}' ('{}'), not xkb — using 'us' for keycodes + unicode hex",
+            chosen.0, chosen.1
+        );
+        return Some(LayoutId::new("us", ""));
+    }
+
+    let (layout, variant) = split_layout_variant(&chosen.1, "");
+    let id = LayoutId::new(layout, variant);
+    eprintln!(
+        "[Pepper X uinput] detected active layout from sources[{index}]: {}",
+        id.display()
+    );
+    Some(id)
+}
+
+fn gsettings_get(schema: &str, key: &str) -> Option<String> {
+    let output = std::process::Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout)
+    }
+}
+
+/// Parse `uint32 N` or bare integer from gsettings.
+fn parse_gsettings_uint32(raw: &str) -> Option<u32> {
+    let s = raw.trim();
+    if let Some(rest) = s.strip_prefix("uint32") {
+        return rest.trim().parse().ok();
+    }
+    s.parse().ok()
+}
+
+/// Parse `[('xkb', 'fr+mac'), ('xkb', 'us'), ('ibus', 'mozc-jp')]`.
+fn parse_gsettings_input_sources(raw: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = raw;
+    while let Some(open) = rest.find('(') {
+        rest = &rest[open..];
+        match parse_gsettings_pair(rest) {
+            Some((kind, id, consumed)) => {
+                out.push((kind, id));
+                rest = &rest[consumed..];
+            }
+            None => {
+                rest = &rest[1..];
+            }
+        }
+    }
+    out
+}
+
+/// Parse a single `('type', 'id')` starting at `s[0] == '('`. Returns bytes consumed.
+fn parse_gsettings_pair(s: &str) -> Option<(String, String, usize)> {
+    if !s.starts_with('(') {
+        return None;
+    }
+    let kind_start = s.find('\'')?;
+    let kind_end = kind_start + 1 + s[kind_start + 1..].find('\'')?;
+    let kind = s[kind_start + 1..kind_end].to_string();
+
+    let after_kind = &s[kind_end + 1..];
+    let id_rel = after_kind.find('\'')?;
+    let id_start = kind_end + 1 + id_rel;
+    let id_end = id_start + 1 + s[id_start + 1..].find('\'')?;
+    let id = s[id_start + 1..id_end].to_string();
+
+    let after_id = &s[id_end + 1..];
+    let close_rel = after_id.find(')')?;
+    let consumed = id_end + 1 + close_rel + 1;
+    Some((kind, id, consumed))
+}
+
+fn first_xkb_entry(entries: &[(String, String)]) -> Option<LayoutId> {
+    let first = entries.first()?;
+    if first.0 != "xkb" {
+        // Active source is an IME — keycodes still go through an underlying xkb map.
+        // Prefer the first xkb entry in the list; otherwise fall back to us.
+        if let Some((_, id)) = entries.iter().find(|(k, _)| k == "xkb") {
+            let (layout, variant) = split_layout_variant(id, "");
+            return Some(LayoutId::new(layout, variant));
+        }
+        eprintln!(
+            "[Pepper X uinput] active input source is non-xkb ('{}', '{}') — using 'us' + unicode hex",
+            first.0, first.1
+        );
+        return Some(LayoutId::new("us", ""));
+    }
+    let (layout, variant) = split_layout_variant(&first.1, "");
+    Some(LayoutId::new(layout, variant))
+}
+
+fn detect_setxkbmap_layout() -> Option<LayoutId> {
+    let output = std::process::Command::new("setxkbmap")
+        .args(["-query"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut layout_line = None;
+    let mut variant_line = None;
+    for line in stdout.lines() {
+        if let Some(v) = line.strip_prefix("layout:") {
+            layout_line = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("variant:") {
+            variant_line = Some(v.trim().to_string());
+        }
+    }
+    let layout_csv = layout_line?;
+    // setxkbmap may list all layouts comma-separated; first is often the active group on X11.
+    let layout = layout_csv.split(',').next()?.trim();
+    if layout.is_empty() {
+        return None;
+    }
+    let variant = variant_line
+        .as_deref()
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("");
+    let id = LayoutId::new(layout, variant);
+    eprintln!(
+        "[Pepper X uinput] detected layout from setxkbmap: {}",
+        id.display()
+    );
+    Some(id)
+}
+
+fn detect_etc_default_keyboard() -> Option<LayoutId> {
+    let content = std::fs::read_to_string("/etc/default/keyboard").ok()?;
+    let mut layout = None;
+    let mut variant = None;
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("XKBLAYOUT=") {
+            layout = Some(v.trim_matches('"').trim().to_string());
+        } else if let Some(v) = line.strip_prefix("XKBVARIANT=") {
+            variant = Some(v.trim_matches('"').trim().to_string());
+        }
+    }
+    let layout_csv = layout?;
+    let layout = layout_csv.split(',').next()?.trim();
+    if layout.is_empty() {
+        return None;
+    }
+    let variant = variant
+        .as_deref()
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("");
+    let id = LayoutId::new(layout, variant);
+    eprintln!(
+        "[Pepper X uinput] detected layout from /etc/default/keyboard: {}",
+        id.display()
+    );
+    Some(id)
 }
 
 fn build_char_mapper(layout: &str, variant: &str) -> Result<CharMapper, String> {
@@ -408,46 +702,6 @@ fn resolve_stroke(mapper: &CharMapper, ch: char) -> CharStroke {
     CharStroke::UnicodeHex(ch as u32)
 }
 
-fn detect_layout() -> String {
-    // Try reading from gsettings
-    if let Ok(output) = std::process::Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.input-sources", "sources"])
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Format: [('xkb', 'us'), ('xkb', 'fr+mac')]
-        if let Some(start) = stdout.find("'xkb', '") {
-            let rest = &stdout[start + 8..];
-            if let Some(end) = rest.find('\'') {
-                let layout = &rest[..end];
-                if !layout.is_empty() {
-                    eprintln!("[Pepper X uinput] detected layout from gsettings: {layout}");
-                    return layout.to_string();
-                }
-            }
-        }
-    }
-
-    // Try /etc/default/keyboard
-    if let Ok(content) = std::fs::read_to_string("/etc/default/keyboard") {
-        for line in content.lines() {
-            if let Some(layout) = line.strip_prefix("XKBLAYOUT=") {
-                let layout = layout.trim_matches('"').trim();
-                if !layout.is_empty() {
-                    let first = layout.split(',').next().unwrap_or(layout);
-                    eprintln!(
-                        "[Pepper X uinput] detected layout from /etc/default/keyboard: {first}"
-                    );
-                    return first.to_string();
-                }
-            }
-        }
-    }
-
-    eprintln!("[Pepper X uinput] no layout detected, defaulting to 'us'");
-    "us".to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Virtual keyboard
 // ---------------------------------------------------------------------------
@@ -464,12 +718,15 @@ fn create_virtual_keyboard(mapper: &CharMapper) -> Result<VirtualDevice, String>
         keys.insert(chord.keycode);
     }
 
-    // Modifiers + Unicode entry helpers
+    // Modifiers + Unicode entry + clipboard paste helpers
     keys.insert(KeyCode::KEY_LEFTSHIFT);
     keys.insert(KeyCode::KEY_RIGHTSHIFT);
     keys.insert(KeyCode::KEY_LEFTCTRL);
+    keys.insert(KeyCode::KEY_RIGHTCTRL);
+    keys.insert(KeyCode::KEY_LEFTALT);
     keys.insert(KeyCode::KEY_RIGHTALT); // AltGr / ISO_Level3_Shift
     keys.insert(KeyCode::KEY_U);
+    keys.insert(KeyCode::KEY_V); // Ctrl+V clipboard paste fallback
     keys.insert(KeyCode::KEY_SPACE);
     keys.insert(KeyCode::KEY_ENTER);
     keys.insert(KeyCode::KEY_TAB);
@@ -515,7 +772,7 @@ fn create_virtual_keyboard(mapper: &CharMapper) -> Result<VirtualDevice, String>
 fn handle_connection(
     mut stream: UnixStream,
     device: &mut VirtualDevice,
-    mapper: &CharMapper,
+    session: &mut LayoutSession,
 ) -> Result<(), String> {
     let request: UinputInsertRequest = serde_json::from_reader(BufReader::new(
         stream
@@ -524,7 +781,12 @@ fn handle_connection(
     ))
     .map_err(|error| format!("failed to parse helper request: {error}"))?;
 
-    let response = match type_text(device, &request.text, mapper) {
+    // Layout may have changed since last insert (Super+Space). Rebuild map first.
+    if let Err(error) = session.refresh_if_needed() {
+        eprintln!("[Pepper X uinput] layout refresh failed, keeping previous map: {error}");
+    }
+
+    let response = match type_text(device, &request.text, &session.mapper) {
         Ok(()) => UinputInsertResponse {
             ok: true,
             error: None,
@@ -555,6 +817,39 @@ fn type_text(device: &mut VirtualDevice, text: &str, mapper: &CharMapper) -> Res
         .map(|ch| (ch, resolve_stroke(mapper, ch)))
         .collect();
 
+    let needs_unicode = strokes
+        .iter()
+        .any(|(_, stroke)| matches!(stroke, CharStroke::UnicodeHex(_)));
+
+    // Plain QWERTY (us) has no dead keys / accent keys. Ctrl+Shift+U via uinput is
+    // notoriously flaky (sticky modifiers, half-committed hex → garbage like ¾/control
+    // pictures). When any glyph is missing from the active layout, paste the whole
+    // string via clipboard + Ctrl+V — atomic and layout-independent.
+    if needs_unicode {
+        let unmapped = strokes
+            .iter()
+            .filter(|(_, s)| matches!(s, CharStroke::UnicodeHex(_)))
+            .count();
+        match try_paste_via_clipboard(device, text) {
+            Ok(()) => {
+                eprintln!(
+                    "[Pepper X uinput] pasted {} chars via clipboard ({} not on active layout)",
+                    strokes.len(),
+                    unmapped
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Pepper X uinput] clipboard paste unavailable ({error}); falling back to unicode hex"
+                );
+            }
+        }
+    }
+
+    // Start clean: never inherit a stuck Ctrl/Shift/AltGr from a previous insert.
+    release_all_modifiers(device)?;
+
     let mut unicode_fallbacks = 0u32;
     for (ch, stroke) in &strokes {
         match stroke {
@@ -576,10 +871,14 @@ fn type_text(device: &mut VirtualDevice, text: &str, mapper: &CharMapper) -> Res
                     ch
                 );
                 emit_unicode_hex(device, *cp, mapper)?;
+                // Hex entry is easy to leave half-open; force modifiers up before next char.
+                release_all_modifiers(device)?;
                 std::thread::sleep(INTER_KEY_DELAY);
             }
         }
     }
+
+    release_all_modifiers(device)?;
 
     if unicode_fallbacks > 0 {
         eprintln!(
@@ -614,18 +913,42 @@ fn emit_chord(device: &mut VirtualDevice, chord: KeyChord) -> Result<(), String>
     Ok(())
 }
 
+/// Force-release modifiers we may have pressed. Spurious key-up is harmless; a stuck
+/// Ctrl after Ctrl+Shift+U is not (turns later letters into control chars).
+fn release_all_modifiers(device: &mut VirtualDevice) -> Result<(), String> {
+    for key in [
+        KeyCode::KEY_LEFTCTRL,
+        KeyCode::KEY_RIGHTCTRL,
+        KeyCode::KEY_LEFTSHIFT,
+        KeyCode::KEY_RIGHTSHIFT,
+        KeyCode::KEY_LEFTALT,
+        KeyCode::KEY_RIGHTALT,
+    ] {
+        emit_key(device, key, 0)?;
+    }
+    Ok(())
+}
+
 /// GNOME/IBus/GTK Unicode entry: Ctrl+Shift+U, hex digits, Space to commit.
+///
+/// Last-resort path when the active layout cannot type a codepoint and clipboard
+/// paste is unavailable. Easy to desync — callers must `release_all_modifiers` after.
 fn emit_unicode_hex(
     device: &mut VirtualDevice,
     codepoint: u32,
     mapper: &CharMapper,
 ) -> Result<(), String> {
-    // Enter unicode mode
+    release_all_modifiers(device)?;
+
+    // Enter unicode mode: hold Ctrl+Shift, tap U, then fully release modifiers
+    // before any hex digit (GTK rejects digits while modifiers are still down).
     emit_key(device, KeyCode::KEY_LEFTCTRL, 1)?;
     emit_key(device, KeyCode::KEY_LEFTSHIFT, 1)?;
+    std::thread::sleep(KEY_HOLD_DELAY);
     emit_key(device, KeyCode::KEY_U, 1)?;
     std::thread::sleep(KEY_HOLD_DELAY);
     emit_key(device, KeyCode::KEY_U, 0)?;
+    std::thread::sleep(KEY_HOLD_DELAY);
     emit_key(device, KeyCode::KEY_LEFTSHIFT, 0)?;
     emit_key(device, KeyCode::KEY_LEFTCTRL, 0)?;
     std::thread::sleep(UNICODE_MODE_DELAY);
@@ -635,17 +958,134 @@ fn emit_unicode_hex(
         let chord = mapper.hex_digits.get(&digit).copied().ok_or_else(|| {
             format!("internal error: missing hex digit mapping for {digit:?}")
         })?;
-        emit_chord(device, chord)?;
-        std::thread::sleep(INTER_KEY_DELAY);
+        // Hex digits must be plain key presses — never with leftover AltGr/Shift
+        // from a previous dead-key chord on another layout.
+        if chord.shift || chord.alt_gr {
+            emit_chord(device, chord)?;
+        } else {
+            emit_key(device, chord.keycode, 1)?;
+            std::thread::sleep(KEY_HOLD_DELAY);
+            emit_key(device, chord.keycode, 0)?;
+        }
+        std::thread::sleep(DEAD_KEY_DELAY);
     }
 
-    // Commit
+    // Commit (Space is safer than Enter — Enter can submit forms).
     emit_key(device, KeyCode::KEY_SPACE, 1)?;
     std::thread::sleep(KEY_HOLD_DELAY);
     emit_key(device, KeyCode::KEY_SPACE, 0)?;
     std::thread::sleep(UNICODE_MODE_DELAY);
 
+    release_all_modifiers(device)?;
     Ok(())
+}
+
+/// Paste `text` via the session clipboard + Ctrl+V.
+///
+/// Used when the active XKB layout cannot express one or more characters as key
+/// chords (typical: French accents on plain US QWERTY). Far more reliable than
+/// synthetic Ctrl+Shift+U through uinput.
+fn try_paste_via_clipboard(device: &mut VirtualDevice, text: &str) -> Result<(), String> {
+    let previous = read_clipboard_text();
+    set_clipboard_text(text)?;
+    std::thread::sleep(Duration::from_millis(20));
+
+    release_all_modifiers(device)?;
+
+    emit_key(device, KeyCode::KEY_LEFTCTRL, 1)?;
+    emit_key(device, KeyCode::KEY_V, 1)?;
+    std::thread::sleep(KEY_HOLD_DELAY);
+    emit_key(device, KeyCode::KEY_V, 0)?;
+    emit_key(device, KeyCode::KEY_LEFTCTRL, 0)?;
+    release_all_modifiers(device)?;
+
+    // Give the target app time to request clipboard contents before restore.
+    std::thread::sleep(CLIPBOARD_PASTE_DELAY);
+
+    match previous {
+        Some(prev) => {
+            if let Err(error) = set_clipboard_text(&prev) {
+                eprintln!("[Pepper X uinput] failed to restore clipboard: {error}");
+            }
+        }
+        None => {
+            // Best-effort clear so we do not leave the insert text sitting around.
+            let _ = clear_clipboard();
+        }
+    }
+
+    Ok(())
+}
+
+fn set_clipboard_text(text: &str) -> Result<(), String> {
+    // Prefer Wayland, then X11 tools. Stdin avoids shell/argv quoting issues.
+    if pipe_to_command("wl-copy", &["--type", "text/plain"], text).is_ok() {
+        return Ok(());
+    }
+    if pipe_to_command("xclip", &["-selection", "clipboard"], text).is_ok() {
+        return Ok(());
+    }
+    if pipe_to_command("xsel", &["--clipboard", "--input"], text).is_ok() {
+        return Ok(());
+    }
+    Err("no clipboard tool found (need wl-copy, xclip, or xsel)".into())
+}
+
+fn read_clipboard_text() -> Option<String> {
+    if let Ok(text) = stdout_from_command("wl-paste", &["--no-newline"]) {
+        return Some(text);
+    }
+    if let Ok(text) = stdout_from_command("xclip", &["-selection", "clipboard", "-o"]) {
+        return Some(text);
+    }
+    if let Ok(text) = stdout_from_command("xsel", &["--clipboard", "--output"]) {
+        return Some(text);
+    }
+    None
+}
+
+fn clear_clipboard() -> Result<(), String> {
+    set_clipboard_text("")
+}
+
+fn pipe_to_command(bin: &str, args: &[&str], text: &str) -> Result<(), String> {
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("{bin}: {error}"))?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("{bin}: stdin not piped"))?;
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|error| format!("{bin}: write failed: {error}"))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("{bin}: wait failed: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{bin}: exit {status}"))
+    }
+}
+
+fn stdout_from_command(bin: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(bin)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("{bin}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{bin}: exit {}", output.status));
+    }
+    String::from_utf8(output.stdout).map_err(|error| format!("{bin}: utf8: {error}"))
 }
 
 fn emit_key(device: &mut VirtualDevice, key: KeyCode, value: i32) -> Result<(), String> {
@@ -743,6 +1183,60 @@ mod tests {
     }
 
     #[test]
+    fn parse_gsettings_input_sources_list() {
+        let raw = "[('xkb', 'fr+mac'), ('xkb', 'fr'), ('xkb', 'us')]";
+        let entries = parse_gsettings_input_sources(raw);
+        assert_eq!(
+            entries,
+            vec![
+                ("xkb".into(), "fr+mac".into()),
+                ("xkb".into(), "fr".into()),
+                ("xkb".into(), "us".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_gsettings_input_sources_with_ibus() {
+        let raw = "[('ibus', 'mozc-jp'), ('xkb', 'us')]";
+        let entries = parse_gsettings_input_sources(raw);
+        assert_eq!(entries[0], ("ibus".into(), "mozc-jp".into()));
+        assert_eq!(entries[1], ("xkb".into(), "us".into()));
+    }
+
+    #[test]
+    fn first_xkb_entry_prefers_active_xkb() {
+        let entries = vec![
+            ("xkb".into(), "us".into()),
+            ("xkb".into(), "fr+mac".into()),
+        ];
+        let id = first_xkb_entry(&entries).unwrap();
+        assert_eq!(id, LayoutId::new("us", ""));
+    }
+
+    #[test]
+    fn first_xkb_entry_skips_ime_to_underlying_xkb() {
+        let entries = vec![
+            ("ibus".into(), "mozc-jp".into()),
+            ("xkb".into(), "fr+mac".into()),
+        ];
+        let id = first_xkb_entry(&entries).unwrap();
+        assert_eq!(id, LayoutId::new("fr", "mac"));
+    }
+
+    #[test]
+    fn parse_gsettings_uint32_forms() {
+        assert_eq!(parse_gsettings_uint32("uint32 2"), Some(2));
+        assert_eq!(parse_gsettings_uint32("0"), Some(0));
+    }
+
+    #[test]
+    fn layout_id_display() {
+        assert_eq!(LayoutId::new("fr", "mac").display(), "fr+mac");
+        assert_eq!(LayoutId::new("us", "").display(), "us");
+    }
+
+    #[test]
     fn apostrophe_phrase_fully_resolves_on_fr() {
         let mapper = mapper_for_layout("fr");
         let text = "C'est peut-être bon";
@@ -760,6 +1254,65 @@ mod tests {
                 CharStroke::Chords(_)
             ),
             "ê in sample phrase must use layout chords on fr"
+        );
+    }
+
+    #[test]
+    fn plain_us_has_no_dead_keys_so_french_accents_need_fallback() {
+        // Root cause of QWERTY garbage: plain `us` has zero dead keys, so è/ê/… cannot
+        // be typed as chords. type_text must then paste (clipboard) or unicode-hex.
+        let mapper = mapper_for_layout("us");
+        assert!(
+            !mapper.map.contains_key(&'è'),
+            "plain us must not claim a direct/dead-key mapping for è"
+        );
+        assert!(
+            !mapper.map.contains_key(&'ê'),
+            "plain us must not claim a direct/dead-key mapping for ê"
+        );
+        match resolve_stroke(&mapper, 'è') {
+            CharStroke::UnicodeHex(cp) => assert_eq!(cp, 'è' as u32),
+            CharStroke::Chords(seq) => panic!("è should not be a chord on plain us: {seq:?}"),
+        }
+        // ASCII still direct — so mixed strings only paste when an accent appears.
+        match resolve_stroke(&mapper, 'T') {
+            CharStroke::Chords(seq) => assert_eq!(seq.len(), 1),
+            CharStroke::UnicodeHex(_) => panic!("ASCII T must be a chord on us"),
+        }
+    }
+
+    #[test]
+    fn us_intl_maps_french_accents_via_dead_keys() {
+        let mapper = build_char_mapper("us", "intl").expect("us(intl) should compile");
+        for ch in ['è', 'ê', 'é', 'à'] {
+            match resolve_stroke(&mapper, ch) {
+                CharStroke::Chords(seq) => {
+                    assert!(
+                        !seq.is_empty() && seq.len() <= 2,
+                        "{ch} should be direct or dead+base on us(intl), got {seq:?}"
+                    );
+                }
+                CharStroke::UnicodeHex(cp) => {
+                    panic!("{ch} should be layout-mappable on us(intl), got U+{cp:04X}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn french_sentence_on_us_triggers_unicode_for_accent_only() {
+        let mapper = mapper_for_layout("us");
+        let text = "Très bien que non";
+        let mut unicode_chars = Vec::new();
+        for ch in text.chars() {
+            if matches!(resolve_stroke(&mapper, ch), CharStroke::UnicodeHex(_)) {
+                unicode_chars.push(ch);
+            }
+        }
+        assert_eq!(
+            unicode_chars,
+            vec!['è'],
+            "only è needs fallback on plain us for this phrase"
         );
     }
 }

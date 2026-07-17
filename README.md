@@ -7,7 +7,7 @@ GNOME-first local dictation for Linux. Hold a key combo, speak, release — your
 - **Hold Alt+Super** (configurable) to record, release to stop
 - **Streaming transcription** via Nemotron 0.6B — text is ready the instant you stop talking
 - **LLM cleanup** via Qwen 3.5 — fixes filler words, punctuation, capitalization, self-corrections
-- **Text insertion** via uinput virtual keyboard — types directly into any focused app
+- **Text insertion** — AT-SPI first when possible; XKB-aware uinput fallback for hostile apps (Wine, some terminals, custom UIs)
 - **Window OCR context** — captures screen text to help the cleanup model disambiguate names and terms
 - **Speaker diarization** — filters out other voices (experimental)
 
@@ -36,15 +36,19 @@ sudo apt install \
   libadwaita-1-dev libatspi2.0-dev libgirepository1.0-dev \
   libglib2.0-dev libgtk-4-dev libgtk4-layer-shell-dev \
   libvulkan-dev libxkbcommon-dev \
-  pkg-config tesseract-ocr
+  pkg-config tesseract-ocr \
+  wl-clipboard xclip
 
 # Fedora
 sudo dnf install \
   cargo cmake gcc gcc-c++ \
   at-spi2-core-devel glib2-devel gobject-introspection-devel \
   gtk4-devel libadwaita-devel libxkbcommon-devel vulkan-loader-devel \
-  pkgconf-pkg-config tesseract
+  pkgconf-pkg-config tesseract \
+  wl-clipboard xclip
 ```
+
+`wl-clipboard` (`wl-copy`) and/or `xclip` (or `xsel`) are recommended so the uinput helper can paste glyphs that the active keyboard layout cannot type (accents on plain US QWERTY, CJK, Thai, etc.).
 
 #### GPU acceleration for cleanup (optional, NVIDIA)
 
@@ -122,6 +126,29 @@ That's it. The app:
 2. Pre-warms the cleanup model in the background
 3. Listens for your trigger keys (Alt+Super by default)
 
+### Text insertion -multilingual support with dynamic XKB + smart clipboard fallback-
+
+Pepper X inserts the final transcript into the focused app using a fallback chain:
+
+1. **AT-SPI** — semantic editable-text / key-string when the app exposes accessibility
+2. **Clipboard paste** (platform path) — when available
+3. **`pepperx-uinput-helper`** — last resort for apps that ignore accessibility (some terminals, Wine, canvas UIs)
+
+The uinput helper does **not** assume a fixed US keymap. On every insert it:
+
+1. **Detects the currently active layout** (what Super+Space selected), not only the first GNOME source:
+   - `PEPPERX_XKB_LAYOUT` / `PEPPERX_XKB_VARIANT` if set (override)
+   - GNOME `mru-sources[0]`, else `sources[current]`
+   - `setxkbmap -query`, then `/etc/default/keyboard`, then default `us`
+2. **Builds an XKB reverse map** for that layout: direct chords (including Shift/AltGr) plus **dead-key** sequences (e.g. `^` + `e` → `ê` on French AZERTY / Mac variants).
+3. **Types chords** when every character is on the layout.
+4. **Pastes the whole string** (clipboard + Ctrl+V) when **any** character is missing — e.g. French accents on plain `us` (no dead keys), or Chinese/Japanese/Thai/etc. Ctrl+Shift+U via uinput is avoided as primary path because sticky modifiers produce garbage.
+5. **Unicode hex entry** only if no clipboard tool is installed.
+
+Clipboard tools tried in order: `wl-copy`, `xclip`, `xsel`. Previous clipboard contents are restored after paste when possible.
+
+**Limits:** apps that block paste or use a non-Ctrl+V paste binding (many terminals want Ctrl+Shift+V) may still fail on unmappable glyphs; install a clipboard tool for best results when switching between layouts (AZERTY ↔ QWERTY) mid-session.
+
 ### Settings
 
 The app window is organized into sections:
@@ -151,7 +178,7 @@ pepper-x --rerun-archived-run <run-id>
 
 - **`pepper-x`** — GTK4/libadwaita app, owns the recording pipeline, settings, history
 - **`pepperx-cleanup-helper`** — Persistent subprocess running llama.cpp (llama-cpp-4) for Qwen 3.5 inference, isolated to avoid ONNX Runtime symbol collision with the ASR engine
-- **`pepperx-uinput-helper`** — Persistent subprocess with XKB-aware virtual keyboard for text injection
+- **`pepperx-uinput-helper`** — Persistent uinput daemon: active-layout XKB reverse map, dead keys, clipboard paste for off-layout Unicode
 - **`pepperx@obra` GNOME extension** — Tray icon, floating status pill overlay, D-Bus bridge
 
 ### Key crates
@@ -166,7 +193,7 @@ pepper-x --rerun-archived-run <run-id>
 | `pepperx-models` | Model catalog, download, readiness checking |
 | `pepperx-platform-gnome` | evdev modifier capture, AT-SPI text insertion, OCR context |
 | `pepperx-ipc` | D-Bus service for extension communication |
-| `pepperx-uinput-helper` | XKB-aware keystroke injection |
+| `pepperx-uinput-helper` | Active-layout XKB chords + clipboard Unicode fallback |
 
 ## Tests
 
