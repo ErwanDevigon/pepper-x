@@ -8,11 +8,14 @@ use std::time::{Duration, Instant};
 const CLEANUP_BACKEND_NAME: &str = "llama.cpp";
 pub const ORDINARY_DICTATION_PROMPT_PROFILE: &str = "ordinary-dictation";
 pub const LITERAL_DICTATION_PROMPT_PROFILE: &str = "literal-dictation";
-const CLEANUP_MAX_TOKENS: usize = 256;
+/// Token budget for cleaned output. French transcripts with accents need more
+/// headroom than short English phrases; keep bounded for interactive latency.
+const CLEANUP_MAX_TOKENS: usize = 512;
 const CLEANUP_OCR_CONTEXT_LIMIT: usize = 4000;
 const CLEANUP_CORRECTION_MEMORY_LIMIT: usize = 2048;
 const CLEANUP_CUSTOM_PROMPT_LIMIT: usize = 2048;
-const CLEANUP_TEMPERATURE: f32 = 0.1;
+/// Low temperature keeps cleanup deterministic (punctuation/accents stable).
+const CLEANUP_TEMPERATURE: f32 = 0.0;
 const CLEANUP_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DEFAULT_CLEANUP_HELPER_BIN: &str = "/usr/libexec/pepper-x/pepperx-cleanup-helper";
@@ -263,21 +266,24 @@ fn prompt_preamble(profile: &str) -> &'static str {
 }
 
 const ORDINARY_DICTATION_PREAMBLE: &str = "/no_think
-You are a transcript cleaner. You will receive raw speech-to-text output. Return the cleaned version on a single line. Rules:
-1. Remove filler words: um, uh, like, you know, basically, literally, sort of, kind of
-2. Fix capitalization and punctuation
-3. If the speaker says \"scratch that\" or \"never mind\", delete the preceding clause
+You are a transcript cleaner for speech-to-text (French and English). Return ONLY the cleaned transcript on a single line. Rules:
+1. Remove filler words: um, uh, like, you know, basically, literally, sort of, kind of, euh, eh, bah, ben, hein, voilà, genre, en fait, du coup
+2. Fix capitalization and punctuation. Restore correct French accents (é è ê ë à â ù û ô î ï ç œ æ) and special characters when the spoken word is clear.
+3. If the speaker says \"scratch that\", \"never mind\", \"non en fait\", or \"ignore\", delete the preceding clause
 4. Keep ALL sentences. Never drop or summarize content. Output every sentence the speaker said.
-5. Do not add words that were not spoken
+5. Do not add words that were not spoken. Preserve meaning exactly.
+6. Reply with the cleaned text only — no quotes, no markdown, no explanation.
 ";
 
 const LITERAL_DICTATION_PREAMBLE: &str = "/no_think
-You lightly normalize speech-recognition transcripts. Return ONLY the transcript on a single line.
+You lightly normalize speech-recognition transcripts (French and English). Return ONLY the transcript on a single line.
 
 Rules:
 - Preserve spoken filler words, hesitations, and casing when they appear intentional.
 - Fix only obvious transcription errors that change the words themselves.
+- Restore correct French accents and special characters when the intended word is clear.
 - Properly punctuate sentences.
+- Reply with the text only — no quotes, no markdown, no explanation.
 
 ";
 
@@ -301,17 +307,54 @@ pub fn prefill_cleanup_system_prompt(request: &CleanupRequest) {
         gpu_layers: request.cleanup_gpu_layers,
     };
 
+    // serde_json always emits valid UTF-8, including accented French.
     let Ok(json) = serde_json::to_string(&prefill) else {
+        eprintln!("[Pepper X] cleanup prefill: failed to serialize request JSON");
         return;
     };
 
     eprintln!(
-        "[Pepper X] cleanup prefill: use_gpu={} gpu_layers={} ({} chars json)",
+        "[Pepper X] cleanup prefill: use_gpu={} gpu_layers={} ({} bytes json, {} chars system)",
         request.cleanup_use_gpu,
         request.cleanup_gpu_layers,
         json.len(),
+        prefill_system_char_len(&prefill),
     );
-    let _ = send_to_helper(&json);
+    if let Err(error) = send_to_helper(&json) {
+        eprintln!("[Pepper X] cleanup prefill failed (non-fatal): {error}");
+    }
+}
+
+fn prefill_system_char_len(prefill: &PrefillRequest) -> usize {
+    prefill.system_prompt.chars().count()
+}
+
+/// Panic-safe cleanup entry point for the live insertion pipeline.
+///
+/// Never panics across the FFI/subprocess boundary: panics inside `run_cleanup`
+/// are converted to `CleanupError::SubprocessError` so the app can fall back to
+/// the raw transcript and still insert text.
+pub fn safe_run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_cleanup(request))) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = panic_payload_message(payload);
+            eprintln!("[Pepper X] cleanup panicked (caught, raw fallback): {message}");
+            Err(CleanupError::SubprocessError {
+                message: format!("cleanup panicked: {message}"),
+            })
+        }
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic".into()
 }
 
 pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupError> {
@@ -330,8 +373,10 @@ pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupErr
     let model_name =
         model_name_from_path(&request.model_path).unwrap_or_else(|| String::from("unknown"));
     let start = Instant::now();
+    let raw_chars = request.transcript_text.chars().count();
 
     let prompt = cleanup_prompt(request);
+    let prompt_chars = prompt.chars().count();
 
     let helper_request = GenerateRequest {
         action: "generate",
@@ -343,6 +388,7 @@ pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupErr
         gpu_layers: request.cleanup_gpu_layers,
     };
 
+    // JSON serialization preserves full Unicode (é, è, ç, œ, …) as UTF-8.
     let request_json = serde_json::to_string(&helper_request).map_err(|error| {
         CleanupError::SubprocessError {
             message: format!("failed to serialize helper request: {error}"),
@@ -350,17 +396,26 @@ pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupErr
     })?;
 
     eprintln!(
-        "[Pepper X] cleanup generate: use_gpu={} gpu_layers={}",
+        "[Pepper X] cleanup generate: use_gpu={} gpu_layers={} raw_chars={} prompt_chars={} json_bytes={}",
         request.cleanup_use_gpu,
         request.cleanup_gpu_layers,
+        raw_chars,
+        prompt_chars,
+        request_json.len(),
     );
 
     let generated = spawn_cleanup_helper(&request_json, &model_name)?;
 
     let cleaned_text = normalize_cleanup_output(&generated);
     if cleaned_text.is_empty() || cleaned_text == "..." {
-        // Fall back to raw transcript when model output is unusable
-        let fallback = request.transcript_text.trim().to_string();
+        // Fall back to raw transcript when model output is unusable.
+        // Insertion must still receive valid text.
+        let fallback = sanitize_insertable_text(request.transcript_text.trim());
+        eprintln!(
+            "[Pepper X] cleanup empty/unusable output → raw fallback ({} chars, model={})",
+            fallback.chars().count(),
+            model_name,
+        );
         return Ok(CleanupResult {
             backend_name: CLEANUP_BACKEND_NAME.into(),
             model_name,
@@ -369,6 +424,15 @@ pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupErr
             used_ocr: has_ocr_context(request),
         });
     }
+
+    eprintln!(
+        "[Pepper X] cleanup ok: {} → {} chars in {}ms (model={}, gpu={})",
+        raw_chars,
+        cleaned_text.chars().count(),
+        start.elapsed().as_millis(),
+        model_name,
+        request.cleanup_use_gpu,
+    );
 
     Ok(CleanupResult {
         backend_name: CLEANUP_BACKEND_NAME.into(),
@@ -488,7 +552,10 @@ fn send_to_helper_raw(request_json: &str) -> Result<String, CleanupError> {
     static HELPER: Mutex<Option<HelperSession>> = Mutex::new(None);
 
     let helper_bin = configured_cleanup_helper_bin_path();
-    let mut guard = HELPER.lock().unwrap();
+    // Poisoned lock must not crash insertion: recover and rebuild the session.
+    let mut guard = HELPER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let needs_spawn = match guard.as_mut() {
         Some(session) => !session.is_alive(),
@@ -498,39 +565,49 @@ fn send_to_helper_raw(request_json: &str) -> Result<String, CleanupError> {
         *guard = Some(HelperSession::spawn(&helper_bin)?);
     }
 
-    let session = guard.as_mut().unwrap();
-
-    session
-        .stdin
-        .write_all(request_json.as_bytes())
-        .map_err(|error| CleanupError::SubprocessError {
-            message: format!("failed to write to cleanup helper: {error}"),
+    let result = (|| {
+        let session = guard.as_mut().ok_or_else(|| CleanupError::SubprocessError {
+            message: "cleanup helper session missing after spawn".into(),
         })?;
-    session.stdin.write_all(b"\n").map_err(|error| {
-        CleanupError::SubprocessError {
-            message: format!("failed to write newline to cleanup helper: {error}"),
+
+        session
+            .stdin
+            .write_all(request_json.as_bytes())
+            .map_err(|error| CleanupError::SubprocessError {
+                message: format!("failed to write to cleanup helper: {error}"),
+            })?;
+        session.stdin.write_all(b"\n").map_err(|error| {
+            CleanupError::SubprocessError {
+                message: format!("failed to write newline to cleanup helper: {error}"),
+            }
+        })?;
+        session.stdin.flush().map_err(|error| CleanupError::SubprocessError {
+            message: format!("failed to flush cleanup helper stdin: {error}"),
+        })?;
+
+        let mut response_line = String::new();
+        session
+            .stdout
+            .read_line(&mut response_line)
+            .map_err(|error| CleanupError::SubprocessError {
+                message: format!("failed to read from cleanup helper: {error}"),
+            })?;
+
+        if response_line.is_empty() {
+            return Err(CleanupError::SubprocessError {
+                message: "cleanup helper exited unexpectedly".into(),
+            });
         }
-    })?;
-    session.stdin.flush().map_err(|error| CleanupError::SubprocessError {
-        message: format!("failed to flush cleanup helper stdin: {error}"),
-    })?;
 
-    let mut response_line = String::new();
-    session
-        .stdout
-        .read_line(&mut response_line)
-        .map_err(|error| CleanupError::SubprocessError {
-            message: format!("failed to read from cleanup helper: {error}"),
-        })?;
+        Ok(response_line)
+    })();
 
-    if response_line.is_empty() {
+    if result.is_err() {
+        // Drop a broken session so the next request respawns cleanly.
         *guard = None;
-        return Err(CleanupError::SubprocessError {
-            message: "cleanup helper exited unexpectedly".into(),
-        });
     }
 
-    Ok(response_line)
+    result
 }
 
 fn wait_with_timeout(
@@ -586,9 +663,26 @@ fn normalize_cleanup_output(output: &str) -> String {
         .trim_matches('"')
         .trim();
 
-    first_line
+    let without_label = first_line
         .strip_prefix("Cleaned transcript:")
         .unwrap_or(first_line)
+        .trim();
+
+    // Drop NULs and other C0 controls (except TAB) so AT-SPI / CString insert
+    // never fails with InvalidInsertText, while keeping full Unicode accents.
+    sanitize_insertable_text(without_label)
+}
+
+/// Keep printable Unicode (including French accents) and common whitespace.
+/// Strip NULs and other C0 controls that break CString / AT-SPI insertion.
+pub(crate) fn sanitize_insertable_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| match ch {
+            '\t' | '\n' | '\r' => true,
+            c if c.is_control() => false,
+            _ => true,
+        })
+        .collect::<String>()
         .trim()
         .to_string()
 }

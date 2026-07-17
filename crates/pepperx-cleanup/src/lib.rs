@@ -2,8 +2,8 @@ pub mod cleanup;
 
 pub use cleanup::{
     cleanup_prompt, cleanup_system_prompt, prefill_cleanup_system_prompt, run_cleanup,
-    CleanupError, CleanupRequest, CleanupResult, LITERAL_DICTATION_PROMPT_PROFILE,
-    ORDINARY_DICTATION_PROMPT_PROFILE,
+    safe_run_cleanup, CleanupError, CleanupRequest, CleanupResult,
+    LITERAL_DICTATION_PROMPT_PROFILE, ORDINARY_DICTATION_PROMPT_PROFILE,
 };
 
 #[cfg(test)]
@@ -310,5 +310,79 @@ mod cleanup_runtime {
     fn strip_reasoning_tags_handles_think_with_attributes() {
         let input = "<think type=\"internal\">reasoning</think>Clean output.";
         assert_eq!(strip_reasoning_tags(input), "Clean output.");
+    }
+
+    #[test]
+    fn cleanup_prompt_preserves_french_accents_in_transcript() {
+        let transcript = "j'ai mangé une crêpe à l'hôtel près de l'île";
+        let prompt = cleanup_prompt(&CleanupRequest {
+            transcript_text: transcript.into(),
+            model_path: PathBuf::from("/tmp/pepper-x-present.gguf"),
+            supporting_context_text: None,
+            ocr_text: None,
+            correction_memory_text: None,
+            prompt_profile: ORDINARY_DICTATION_PROMPT_PROFILE.into(),
+            custom_prompt_text: None,
+            cleanup_use_gpu: false,
+            cleanup_gpu_layers: 0,
+        });
+
+        assert!(prompt.contains(transcript));
+        assert!(prompt.contains("é"));
+        assert!(prompt.contains("French accents") || prompt.contains("é è ê"));
+        assert!(prompt.contains("euh"));
+    }
+
+    #[test]
+    fn sanitize_insertable_text_strips_nul_keeps_accents() {
+        use crate::cleanup::sanitize_insertable_text;
+
+        let input = "café\0 crème\nbrûlée";
+        let sanitized = sanitize_insertable_text(input);
+        assert!(!sanitized.contains('\0'));
+        assert!(sanitized.contains('é') || sanitized.contains("é"));
+        assert!(sanitized.contains("café"));
+        assert!(sanitized.contains("crème"));
+    }
+
+    #[test]
+    fn safe_run_cleanup_returns_error_not_panic_on_missing_model() {
+        use super::safe_run_cleanup;
+
+        let error = safe_run_cleanup(&CleanupRequest {
+            transcript_text: "bonjour café".into(),
+            model_path: PathBuf::from("/tmp/pepper-x-missing-safe.gguf"),
+            supporting_context_text: None,
+            ocr_text: None,
+            correction_memory_text: None,
+            prompt_profile: ORDINARY_DICTATION_PROMPT_PROFILE.into(),
+            custom_prompt_text: None,
+            cleanup_use_gpu: true,
+            cleanup_gpu_layers: 99,
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            CleanupError::MissingModelPath(PathBuf::from("/tmp/pepper-x-missing-safe.gguf"))
+        );
+    }
+
+    #[test]
+    fn cleanup_request_carries_gpu_toggle_fields() {
+        let request = CleanupRequest {
+            transcript_text: "test".into(),
+            model_path: PathBuf::from("/tmp/model.gguf"),
+            supporting_context_text: None,
+            ocr_text: None,
+            correction_memory_text: None,
+            prompt_profile: ORDINARY_DICTATION_PROMPT_PROFILE.into(),
+            custom_prompt_text: None,
+            cleanup_use_gpu: true,
+            cleanup_gpu_layers: 33,
+        };
+
+        assert!(request.cleanup_use_gpu);
+        assert_eq!(request.cleanup_gpu_layers, 33);
     }
 }
