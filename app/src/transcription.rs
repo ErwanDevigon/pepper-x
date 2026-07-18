@@ -221,8 +221,9 @@ pub struct ExternalAudioImportResult {
     pub markdown_path: PathBuf,
 }
 
-/// Transcribe an external WAV, archive it as a history run (`wav-import`),
-/// and write a Markdown transcript next to the source audio file.
+/// Transcribe an external audio file (WAV/MP3/FLAC/OGG/AAC/…), archive it as a
+/// history run (`wav-import`), and write a Markdown transcript next to the
+/// source audio file.
 pub fn import_external_audio_file(
     audio_path: &Path,
 ) -> Result<ExternalAudioImportResult, TranscriptionRunError> {
@@ -1584,7 +1585,7 @@ fn update_live_status_after_success(live_status: &SharedLiveStatus, entry: &Tran
 fn describe_asr_error(error: &TranscriptionError) -> String {
     match error {
         TranscriptionError::MissingWavFile(path) => {
-            format!("WAV file does not exist: {}", path.display())
+            format!("audio file does not exist: {}", path.display())
         }
         TranscriptionError::IncompleteModelDir {
             model_dir,
@@ -1595,14 +1596,14 @@ fn describe_asr_error(error: &TranscriptionError) -> String {
             model_dir.display()
         ),
         TranscriptionError::InvalidWaveFile(path) => {
-            format!("invalid WAV file: {}", path.display())
+            format!("invalid or unsupported audio file: {}", path.display())
         }
         TranscriptionError::RecognizerInitializationFailed(model_dir) => format!(
             "failed to initialize recognizer from {}",
             model_dir.display()
         ),
         TranscriptionError::DecodeFailed(path) => {
-            format!("failed to decode {}", path.display())
+            format!("failed to transcribe {}", path.display())
         }
     }
 }

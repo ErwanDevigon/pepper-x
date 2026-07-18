@@ -796,21 +796,49 @@ pub(crate) fn build_history_browser(
                 .root()
                 .and_then(|root| root.downcast::<gtk::Window>().ok());
 
-            let filter = gtk::FileFilter::new();
-            filter.set_name(Some("WAV audio"));
-            filter.add_mime_type("audio/wav");
-            filter.add_mime_type("audio/x-wav");
-            filter.add_pattern("*.wav");
-            filter.add_pattern("*.WAV");
+            let all_audio = gtk::FileFilter::new();
+            all_audio.set_name(Some("Audio files"));
+            for mime in [
+                "audio/wav",
+                "audio/x-wav",
+                "audio/mpeg",
+                "audio/mp3",
+                "audio/flac",
+                "audio/x-flac",
+                "audio/ogg",
+                "audio/opus",
+                "audio/aac",
+                "audio/mp4",
+                "audio/x-m4a",
+                "audio/aiff",
+                "audio/x-aiff",
+            ] {
+                all_audio.add_mime_type(mime);
+            }
+            for pattern in [
+                "*.wav", "*.WAV", "*.wave", "*.mp3", "*.MP3", "*.flac", "*.FLAC", "*.ogg",
+                "*.OGG", "*.oga", "*.opus", "*.aac", "*.AAC", "*.m4a", "*.M4A", "*.mp4",
+                "*.caf", "*.aiff", "*.aif",
+            ] {
+                all_audio.add_pattern(pattern);
+            }
+
+            let wav_only = gtk::FileFilter::new();
+            wav_only.set_name(Some("WAV"));
+            wav_only.add_mime_type("audio/wav");
+            wav_only.add_mime_type("audio/x-wav");
+            wav_only.add_pattern("*.wav");
+            wav_only.add_pattern("*.WAV");
 
             let filters = gio::ListStore::new::<gtk::FileFilter>();
-            filters.append(&filter);
+            filters.append(&all_audio);
+            filters.append(&wav_only);
 
             let dialog = gtk::FileDialog::builder()
                 .title("Load audio file")
                 .modal(true)
                 .filters(&filters)
-                .default_filter(&filter)
+                .default_filter(&all_audio)
                 .build();
 
             let model = model.clone();
@@ -1056,10 +1084,7 @@ fn rebuild_history_list_ui(
 }
 
 fn is_supported_audio_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("wav"))
-        .unwrap_or(false)
+    pepperx_asr::is_supported_audio_extension(path)
 }
 
 fn display_file_name(path: &Path) -> String {
@@ -2228,10 +2253,15 @@ mod history_view_tests {
     }
 
     #[test]
-    fn is_supported_audio_path_accepts_wav_only() {
+    fn is_supported_audio_path_accepts_common_formats() {
         assert!(is_supported_audio_path(Path::new("/tmp/note.wav")));
         assert!(is_supported_audio_path(Path::new("/tmp/NOTE.WAV")));
-        assert!(!is_supported_audio_path(Path::new("/tmp/note.mp3")));
+        assert!(is_supported_audio_path(Path::new("/tmp/note.mp3")));
+        assert!(is_supported_audio_path(Path::new("/tmp/note.flac")));
+        assert!(is_supported_audio_path(Path::new("/tmp/note.ogg")));
+        assert!(is_supported_audio_path(Path::new("/tmp/note.m4a")));
+        assert!(is_supported_audio_path(Path::new("/tmp/note.aac")));
+        assert!(!is_supported_audio_path(Path::new("/tmp/note.txt")));
         assert!(!is_supported_audio_path(Path::new("/tmp/note")));
     }
 

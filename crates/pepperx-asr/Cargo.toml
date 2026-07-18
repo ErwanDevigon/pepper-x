@@ -7,3 +7,16 @@ publish = false
 [dependencies]
 hound = "3.5.1"
 parakeet-rs = { version = "0.3.4", default-features = false, features = ["cpu", "ort-defaults"] }
+# Pure-Rust demux/decode for external audio import (WAV/MP3/FLAC/OGG/AAC/…).
+# Live capture still writes 16 kHz mono WAV via PipeWire + hound.
+symphonia = { version = "0.5.4", features = [
+    "aac",
+    "alac",
+    "flac",
+    "isomp4",
+    "mkv",
+    "mp3",
+    "ogg",
+    "pcm",
+    "wav",
+] }

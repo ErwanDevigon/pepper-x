@@ -1,0 +1,419 @@
+//! Decode common audio containers to mono PCM at the ASR target sample rate.
+//!
+//! Uses [Symphonia](https://github.com/pdeljanov/Symphonia) (pure Rust). Live
+//! capture still produces 16 kHz mono WAV via PipeWire + hound; this module is
+//! for batch import of external files (WAV, MP3, FLAC, OGG/Vorbis, AAC/M4A, …).
+
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use symphonia::core::audio::{AudioBufferRef, Signal};
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+
+/// Sample rate expected by the Nemotron / Parakeet ASR backends.
+pub const TARGET_SAMPLE_RATE: u32 = 16_000;
+
+/// Mono PCM ready for ASR (`TARGET_SAMPLE_RATE`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedAudio {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+}
+
+impl DecodedAudio {
+    pub fn duration_secs(&self) -> f64 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
+        self.samples.len() as f64 / f64::from(self.sample_rate)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeError {
+    MissingFile(PathBuf),
+    OpenFailed(PathBuf),
+    UnsupportedFormat(PathBuf),
+    NoAudioTrack(PathBuf),
+    MissingSampleRate(PathBuf),
+    DecodeFailed { path: PathBuf, detail: String },
+    EmptyAudio(PathBuf),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingFile(path) => {
+                write!(f, "audio file does not exist: {}", path.display())
+            }
+            Self::OpenFailed(path) => write!(f, "failed to open audio file: {}", path.display()),
+            Self::UnsupportedFormat(path) => {
+                write!(f, "unsupported audio format: {}", path.display())
+            }
+            Self::NoAudioTrack(path) => {
+                write!(f, "no audio track in file: {}", path.display())
+            }
+            Self::MissingSampleRate(path) => {
+                write!(f, "audio file missing sample rate: {}", path.display())
+            }
+            Self::DecodeFailed { path, detail } => {
+                write!(f, "failed to decode {}: {detail}", path.display())
+            }
+            Self::EmptyAudio(path) => write!(f, "audio file is empty: {}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+/// Extensions accepted for external audio import (case-insensitive).
+pub const SUPPORTED_AUDIO_EXTENSIONS: &[&str] = &[
+    "wav", "wave", "mp3", "flac", "ogg", "oga", "opus", "aac", "m4a", "mp4", "caf", "aiff", "aif",
+];
+
+/// Return true when `path` has a known importable audio extension.
+pub fn is_supported_audio_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            SUPPORTED_AUDIO_EXTENSIONS
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        })
+        .unwrap_or(false)
+}
+
+/// Decode any supported audio file to mono f32 at [`TARGET_SAMPLE_RATE`].
+pub fn decode_audio_file(path: &Path) -> Result<DecodedAudio, DecodeError> {
+    if !path.is_file() {
+        return Err(DecodeError::MissingFile(path.to_path_buf()));
+    }
+
+    let file = File::open(path).map_err(|_| DecodeError::OpenFailed(path.to_path_buf()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions {
+                enable_gapless: true,
+                ..Default::default()
+            },
+            &MetadataOptions::default(),
+        )
+        .map_err(|error| match error {
+            SymphoniaError::Unsupported(_) => DecodeError::UnsupportedFormat(path.to_path_buf()),
+            other => DecodeError::DecodeFailed {
+                path: path.to_path_buf(),
+                detail: other.to_string(),
+            },
+        })?;
+
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| DecodeError::NoAudioTrack(path.to_path_buf()))?
+        .clone();
+
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .ok_or_else(|| DecodeError::MissingSampleRate(path.to_path_buf()))?;
+
+    let channel_count = track
+        .codec_params
+        .channels
+        .map(|c| c.count())
+        .unwrap_or(1)
+        .max(1);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|error| DecodeError::DecodeFailed {
+            path: path.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+
+    let track_id = track.id;
+    let mut interleaved: Vec<f32> = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::ResetRequired) => {
+                // Seek-less decode: treat reset as end-of-stream for batch import.
+                break;
+            }
+            Err(SymphoniaError::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(SymphoniaError::DecodeError(_)) => {
+                // Skip corrupt packets when possible.
+                continue;
+            }
+            Err(error) => {
+                // Many demuxers surface EOF as a generic error after the last packet.
+                if interleaved.is_empty() {
+                    return Err(DecodeError::DecodeFailed {
+                        path: path.to_path_buf(),
+                        detail: error.to_string(),
+                    });
+                }
+                break;
+            }
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        match decoder.decode(&packet) {
+            Ok(decoded) => append_planar_or_interleaved_f32(&decoded, &mut interleaved),
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(error) => {
+                return Err(DecodeError::DecodeFailed {
+                    path: path.to_path_buf(),
+                    detail: error.to_string(),
+                });
+            }
+        }
+    }
+
+    if interleaved.is_empty() {
+        return Err(DecodeError::EmptyAudio(path.to_path_buf()));
+    }
+
+    let mono = mix_to_mono(&interleaved, channel_count);
+    let samples = resample_mono(&mono, sample_rate, TARGET_SAMPLE_RATE);
+
+    if samples.is_empty() {
+        return Err(DecodeError::EmptyAudio(path.to_path_buf()));
+    }
+
+    Ok(DecodedAudio {
+        samples,
+        sample_rate: TARGET_SAMPLE_RATE,
+    })
+}
+
+/// Mix interleaved multi-channel samples down to mono by averaging channels.
+fn mix_to_mono(interleaved: &[f32], channel_count: usize) -> Vec<f32> {
+    if channel_count <= 1 {
+        return interleaved.to_vec();
+    }
+
+    let frames = interleaved.len() / channel_count;
+    let mut mono = Vec::with_capacity(frames);
+    for frame in 0..frames {
+        let base = frame * channel_count;
+        let mut sum = 0.0f32;
+        for ch in 0..channel_count {
+            sum += interleaved[base + ch];
+        }
+        mono.push(sum / channel_count as f32);
+    }
+    mono
+}
+
+/// Linear-interpolation resampler for mono PCM.
+///
+/// Sufficient for speech ASR; keeps the dependency surface pure-Rust and small.
+pub fn resample_mono(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    if from_rate == 0 || to_rate == 0 {
+        return Vec::new();
+    }
+    if from_rate == to_rate {
+        return samples.to_vec();
+    }
+
+    let ratio = f64::from(to_rate) / f64::from(from_rate);
+    let out_len = ((samples.len() as f64) * ratio).round().max(1.0) as usize;
+    let mut out = Vec::with_capacity(out_len);
+    let last = samples.len() - 1;
+
+    for i in 0..out_len {
+        let src_pos = i as f64 / ratio;
+        let idx = src_pos.floor() as usize;
+        let frac = (src_pos - idx as f64) as f32;
+        if idx >= last {
+            out.push(samples[last]);
+        } else {
+            let s0 = samples[idx];
+            let s1 = samples[idx + 1];
+            out.push(s0 + (s1 - s0) * frac);
+        }
+    }
+    out
+}
+
+fn append_planar_or_interleaved_f32(decoded: &AudioBufferRef<'_>, out: &mut Vec<f32>) {
+    match decoded {
+        AudioBufferRef::F32(buf) => append_from_signal(buf, out),
+        AudioBufferRef::U8(buf) => append_converted(buf, out, |s| (f32::from(s) - 128.0) / 128.0),
+        AudioBufferRef::U16(buf) => {
+            append_converted(buf, out, |s| (f32::from(s) - 32768.0) / 32768.0)
+        }
+        AudioBufferRef::U24(buf) => append_converted(buf, out, |s| {
+            let v = s.inner() as f32;
+            (v - 8_388_608.0) / 8_388_608.0
+        }),
+        AudioBufferRef::U32(buf) => {
+            append_converted(buf, out, |s| (s as f64 / 2_147_483_648.0 - 1.0) as f32)
+        }
+        AudioBufferRef::S8(buf) => append_converted(buf, out, |s| f32::from(s) / 128.0),
+        AudioBufferRef::S16(buf) => append_converted(buf, out, |s| f32::from(s) / 32768.0),
+        AudioBufferRef::S24(buf) => {
+            append_converted(buf, out, |s| s.inner() as f32 / 8_388_608.0)
+        }
+        AudioBufferRef::S32(buf) => {
+            append_converted(buf, out, |s| (s as f64 / 2_147_483_648.0) as f32)
+        }
+        AudioBufferRef::F64(buf) => append_converted(buf, out, |s| s as f32),
+    }
+}
+
+fn append_from_signal(buf: &symphonia::core::audio::AudioBuffer<f32>, out: &mut Vec<f32>) {
+    let channels = buf.spec().channels.count();
+    let frames = buf.frames();
+    out.reserve(frames * channels);
+    for frame in 0..frames {
+        for ch in 0..channels {
+            out.push(buf.chan(ch)[frame]);
+        }
+    }
+}
+
+fn append_converted<S, F>(
+    buf: &symphonia::core::audio::AudioBuffer<S>,
+    out: &mut Vec<f32>,
+    convert: F,
+) where
+    S: symphonia::core::sample::Sample + Copy,
+    F: Fn(S) -> f32,
+{
+    let channels = buf.spec().channels.count();
+    let frames = buf.frames();
+    out.reserve(frames * channels);
+    for frame in 0..frames {
+        for ch in 0..channels {
+            out.push(convert(buf.chan(ch)[frame]));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hound::{SampleFormat, WavSpec, WavWriter};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn supported_extensions_cover_common_formats() {
+        assert!(is_supported_audio_extension(Path::new("a.wav")));
+        assert!(is_supported_audio_extension(Path::new("a.MP3")));
+        assert!(is_supported_audio_extension(Path::new("a.flac")));
+        assert!(is_supported_audio_extension(Path::new("a.ogg")));
+        assert!(is_supported_audio_extension(Path::new("a.m4a")));
+        assert!(is_supported_audio_extension(Path::new("a.aac")));
+        assert!(!is_supported_audio_extension(Path::new("a.txt")));
+        assert!(!is_supported_audio_extension(Path::new("a")));
+    }
+
+    #[test]
+    fn resample_mono_identity_when_rates_match() {
+        let samples = vec![0.0, 0.5, -0.5, 1.0];
+        assert_eq!(resample_mono(&samples, 16_000, 16_000), samples);
+    }
+
+    #[test]
+    fn resample_mono_downsamples_length() {
+        // 32 kHz → 16 kHz: roughly half the samples.
+        let samples: Vec<f32> = (0..320).map(|i| (i as f32) / 320.0).collect();
+        let out = resample_mono(&samples, 32_000, 16_000);
+        assert!((out.len() as i32 - 160).abs() <= 1);
+    }
+
+    #[test]
+    fn decode_mono_16k_wav_fixture_or_synthetic() {
+        let root = unique_tmp("decode-wav");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("tone.wav");
+        write_sine_wav(&path, 16_000, 1, 0.25);
+
+        let decoded = decode_audio_file(&path).expect("decode synthetic wav");
+        assert_eq!(decoded.sample_rate, TARGET_SAMPLE_RATE);
+        assert!(!decoded.samples.is_empty());
+        // ~0.25 s at 16 kHz
+        assert!((decoded.samples.len() as i32 - 4_000).abs() < 200);
+    }
+
+    #[test]
+    fn decode_stereo_48k_wav_is_mixed_and_resampled() {
+        let root = unique_tmp("decode-stereo");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("stereo.wav");
+        write_sine_wav(&path, 48_000, 2, 0.1);
+
+        let decoded = decode_audio_file(&path).expect("decode stereo wav");
+        assert_eq!(decoded.sample_rate, TARGET_SAMPLE_RATE);
+        // 0.1 s at 16 kHz ≈ 1600 samples
+        assert!((decoded.samples.len() as i32 - 1_600).abs() < 100);
+    }
+
+    #[test]
+    fn decode_missing_file_errors() {
+        let err = decode_audio_file(Path::new("/tmp/pepper-x-missing-audio-xyz.wav")).unwrap_err();
+        assert!(matches!(err, DecodeError::MissingFile(_)));
+    }
+
+    fn write_sine_wav(path: &Path, sample_rate: u32, channels: u16, duration_secs: f32) {
+        let spec = WavSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut writer = WavWriter::create(path, spec).unwrap();
+        let total_frames = (sample_rate as f32 * duration_secs) as usize;
+        for n in 0..total_frames {
+            let t = n as f32 / sample_rate as f32;
+            let sample = (t * 440.0 * std::f32::consts::TAU).sin();
+            let amplitude = (sample * i16::MAX as f32 * 0.2) as i16;
+            for _ in 0..channels {
+                writer.write_sample(amplitude).unwrap();
+            }
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn unique_tmp(suffix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("pepper-x-decoder-{suffix}-{unique}"))
+    }
+}
