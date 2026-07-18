@@ -214,6 +214,91 @@ pub fn transcribe_wav_to_log(wav_path: &Path) -> Result<TranscriptEntry, Transcr
     archive_transcription_result(result)
 }
 
+/// Result of importing an external audio file from History → Audio files.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalAudioImportResult {
+    pub entry: TranscriptEntry,
+    pub markdown_path: PathBuf,
+}
+
+/// Transcribe an external WAV, archive it as a history run (`wav-import`),
+/// and write a Markdown transcript next to the source audio file.
+pub fn import_external_audio_file(
+    audio_path: &Path,
+) -> Result<ExternalAudioImportResult, TranscriptionRunError> {
+    let settings = AppSettings::load_or_default();
+    let entry = if settings.cleanup_enabled {
+        transcribe_wav_and_cleanup_to_log(audio_path)?
+    } else {
+        transcribe_wav_to_log(audio_path)?
+    };
+    let markdown_path = write_transcript_markdown_beside_audio(audio_path, &entry)?;
+    Ok(ExternalAudioImportResult {
+        entry,
+        markdown_path,
+    })
+}
+
+/// Markdown path beside the audio: `meeting.wav` → `meeting.md`.
+pub fn markdown_path_for_audio(audio_path: &Path) -> PathBuf {
+    let parent = audio_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = audio_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("transcript");
+    parent.join(format!("{stem}.md"))
+}
+
+fn write_transcript_markdown_beside_audio(
+    audio_path: &Path,
+    entry: &TranscriptEntry,
+) -> Result<PathBuf, TranscriptionRunError> {
+    let markdown_path = markdown_path_for_audio(audio_path);
+    let body = format_transcript_markdown(audio_path, entry);
+    std::fs::write(&markdown_path, body)?;
+    Ok(markdown_path)
+}
+
+fn format_transcript_markdown(audio_path: &Path, entry: &TranscriptEntry) -> String {
+    let file_name = audio_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("audio");
+    let mut body = String::new();
+    body.push_str(&format!("# Transcription: {file_name}\n\n"));
+    body.push_str(&format!("- **Source:** `{}`\n", audio_path.display()));
+    body.push_str(&format!("- **Backend:** {}\n", entry.backend_name));
+    body.push_str(&format!("- **Model:** {}\n", entry.model_name));
+    body.push_str(&format!("- **ASR time:** {} ms\n\n", entry.elapsed_ms));
+    body.push_str("## Transcript\n\n");
+    body.push_str(entry.transcript_text.trim());
+    body.push('\n');
+    if let Some(cleaned) = entry
+        .cleanup
+        .as_ref()
+        .and_then(|cleanup| cleanup.cleaned_text())
+    {
+        body.push_str("\n## Cleaned transcript\n\n");
+        body.push_str(cleaned.trim());
+        body.push('\n');
+        body.push_str(&format!(
+            "\n_Cleaned with {} ({} ms)._\n",
+            entry
+                .cleanup
+                .as_ref()
+                .map(|c| c.model_name.as_str())
+                .unwrap_or("cleanup"),
+            entry
+                .cleanup
+                .as_ref()
+                .map(|c| c.elapsed_ms)
+                .unwrap_or(0)
+        ));
+    }
+    body
+}
+
 pub(crate) fn transcribe_recorded_wav_to_log_with_status(
     request: LivePipelineRequest,
     live_status: SharedLiveStatus,
