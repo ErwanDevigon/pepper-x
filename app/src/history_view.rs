@@ -1,28 +1,66 @@
 use adw::prelude::*;
+use gtk::gio;
 use gtk::glib;
 use gtk::{Align, Orientation, PolicyType, SelectionMode};
 use pepperx_models::{supported_models, ModelKind};
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use crate::history_store::ArchivedRun;
+use crate::history_store::{ArchivedRun, HistoryStore};
 use crate::settings::AppSettings;
-use crate::transcript_log::{DiarizationSummary, TranscriptEntry};
+use crate::transcript_log::{state_root, DiarizationSummary, TranscriptEntry};
+
+/// Which slice of history the browser shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryListMode {
+    /// Live dictation runs (and their archived re-runs).
+    Recordings,
+    /// External audio imports via "Load audio file" (wav-import).
+    AudioFiles,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HistoryBrowserModel {
+    /// Full unfiltered archive.
+    all_runs: Vec<ArchivedRun>,
+    /// Runs visible for the active mode.
     runs: Vec<ArchivedRun>,
+    mode: HistoryListMode,
     selected_index: usize,
 }
 
 impl HistoryBrowserModel {
     pub(crate) fn new(mut runs: Vec<ArchivedRun>) -> Self {
         sort_runs_newest_first(&mut runs);
+        let mode = HistoryListMode::Recordings;
+        let filtered = filter_runs_for_mode(&runs, mode);
         Self {
-            runs,
+            all_runs: runs,
+            runs: filtered,
+            mode,
             selected_index: 0,
         }
+    }
+
+    pub(crate) fn mode(&self) -> HistoryListMode {
+        self.mode
+    }
+
+    pub(crate) fn set_mode(&mut self, mode: HistoryListMode) {
+        if self.mode == mode {
+            return;
+        }
+        let previous_id = self.selected_run_id().map(str::to_string);
+        self.mode = mode;
+        self.rebuild_visible(previous_id.as_deref());
+    }
+
+    pub(crate) fn replace_all_runs(&mut self, mut runs: Vec<ArchivedRun>) {
+        sort_runs_newest_first(&mut runs);
+        let previous_id = self.selected_run_id().map(str::to_string);
+        self.all_runs = runs;
+        self.rebuild_visible(previous_id.as_deref());
     }
 
     pub(crate) fn visible_run_ids(&self) -> Vec<String> {
@@ -104,6 +142,20 @@ impl HistoryBrowserModel {
             .unwrap_or(0.0)
     }
 
+    fn rebuild_visible(&mut self, prefer_run_id: Option<&str>) {
+        self.runs = filter_runs_for_mode(&self.all_runs, self.mode);
+        if let Some(run_id) = prefer_run_id {
+            if self.select_run(run_id) {
+                return;
+            }
+        }
+        self.selected_index = 0;
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
     fn select_index(&mut self, index: usize) -> bool {
         if index >= self.runs.len() {
             return false;
@@ -137,6 +189,32 @@ impl HistoryBrowserModel {
     }
 }
 
+fn filter_runs_for_mode(all_runs: &[ArchivedRun], mode: HistoryListMode) -> Vec<ArchivedRun> {
+    all_runs
+        .iter()
+        .filter(|run| match mode {
+            HistoryListMode::AudioFiles => is_audio_file_lineage(run, all_runs),
+            HistoryListMode::Recordings => !is_audio_file_lineage(run, all_runs),
+        })
+        .cloned()
+        .collect()
+}
+
+/// `wav-import` roots and re-runs of those roots count as Audio files.
+fn is_audio_file_lineage(run: &ArchivedRun, all_runs: &[ArchivedRun]) -> bool {
+    match run.runtime_metadata.input_origin.as_str() {
+        "wav-import" => true,
+        "live-recording" => false,
+        "archived-rerun" => run
+            .parent_run_id
+            .as_deref()
+            .and_then(|parent_id| all_runs.iter().find(|candidate| candidate.run_id == parent_id))
+            .map(|parent| is_audio_file_lineage(parent, all_runs))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Ghost Pepper detail view: build the right-side scrollable page
 // ---------------------------------------------------------------------------
@@ -146,9 +224,43 @@ pub(crate) fn build_history_browser(
     rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
     rerun_cleanup: Option<Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>>,
     play_audio: Option<Rc<dyn Fn(PathBuf)>>,
-) -> gtk::Paned {
+) -> gtk::Box {
     let model = Rc::new(RefCell::new(HistoryBrowserModel::new(runs.to_vec())));
     let settings = AppSettings::load_or_default();
+
+    // --- Toolbar: Load audio (left) + mode switch Recordings | Audio files ---
+    let toolbar = gtk::Box::new(Orientation::Horizontal, 12);
+    toolbar.set_margin_top(12);
+    toolbar.set_margin_bottom(6);
+    toolbar.set_margin_start(12);
+    toolbar.set_margin_end(12);
+
+    let load_audio_button = gtk::Button::builder()
+        .label("Load audio file")
+        .halign(Align::Start)
+        .css_classes(["suggested-action"])
+        .build();
+    let load_status = gtk::Label::builder()
+        .label("")
+        .xalign(0.0)
+        .hexpand(true)
+        .wrap(true)
+        .css_classes(["dim-label", "caption"])
+        .build();
+
+    let mode_box = gtk::Box::new(Orientation::Horizontal, 0);
+    mode_box.add_css_class("linked");
+    mode_box.set_halign(Align::End);
+    let recordings_toggle = gtk::ToggleButton::with_label("Recordings");
+    let audio_files_toggle = gtk::ToggleButton::with_label("Audio files");
+    audio_files_toggle.set_group(Some(&recordings_toggle));
+    recordings_toggle.set_active(true);
+    mode_box.append(&recordings_toggle);
+    mode_box.append(&audio_files_toggle);
+
+    toolbar.append(&load_audio_button);
+    toolbar.append(&load_status);
+    toolbar.append(&mode_box);
 
     // --- Left side: run list ---
     let list_box = gtk::ListBox::builder()
@@ -577,11 +689,274 @@ pub(crate) fn build_history_browser(
     }
 
     // =====================================================================
+    // Mode switch: Recordings <-> Audio files
+    // =====================================================================
+    {
+        let model = model.clone();
+        let list_box = list_box.clone();
+        let metadata_line = metadata_line.clone();
+        let transcription_subtitle = transcription_subtitle.clone();
+        let original_raw_label = original_raw_card.1.clone();
+        let cleanup_subtitle = cleanup_subtitle.clone();
+        let original_cleaned_label = original_cleaned_card.1.clone();
+        let diarization_container = diarization_container.clone();
+        let use_ocr_check = use_ocr_check.clone();
+        let play_button = play_button.clone();
+        let rerun_button = rerun_button.clone();
+        let rerun_cleanup_button = rerun_cleanup_button.clone();
+        let rerun_raw_card_frame = rerun_raw_card.0.clone();
+        let rerun_cleaned_card_frame = rerun_cleaned_card.0.clone();
+        let cleanup_timing_label = cleanup_timing_label.clone();
+        let load_status = load_status.clone();
+
+        let apply_mode = Rc::new({
+            let model = model.clone();
+            let list_box = list_box.clone();
+            let metadata_line = metadata_line.clone();
+            let transcription_subtitle = transcription_subtitle.clone();
+            let original_raw_label = original_raw_label.clone();
+            let cleanup_subtitle = cleanup_subtitle.clone();
+            let original_cleaned_label = original_cleaned_label.clone();
+            let diarization_container = diarization_container.clone();
+            let use_ocr_check = use_ocr_check.clone();
+            let play_button = play_button.clone();
+            let rerun_button = rerun_button.clone();
+            let rerun_cleanup_button = rerun_cleanup_button.clone();
+            let rerun_raw_card_frame = rerun_raw_card_frame.clone();
+            let rerun_cleaned_card_frame = rerun_cleaned_card_frame.clone();
+            let cleanup_timing_label = cleanup_timing_label.clone();
+            move |mode: HistoryListMode| {
+                model.borrow_mut().set_mode(mode);
+                rebuild_history_list_ui(
+                    &model,
+                    &list_box,
+                    &metadata_line,
+                    &transcription_subtitle,
+                    &original_raw_label,
+                    &cleanup_subtitle,
+                    &original_cleaned_label,
+                    &diarization_container,
+                    &use_ocr_check,
+                    &play_button,
+                    &rerun_button,
+                    &rerun_cleanup_button,
+                    &rerun_raw_card_frame,
+                    &rerun_cleaned_card_frame,
+                    &cleanup_timing_label,
+                );
+            }
+        });
+
+        {
+            let apply_mode = apply_mode.clone();
+            let load_status = load_status.clone();
+            recordings_toggle.connect_toggled(move |button| {
+                if button.is_active() {
+                    load_status.set_label("");
+                    apply_mode(HistoryListMode::Recordings);
+                }
+            });
+        }
+        {
+            let apply_mode = apply_mode.clone();
+            let load_status = load_status.clone();
+            audio_files_toggle.connect_toggled(move |button| {
+                if button.is_active() {
+                    load_status.set_label("");
+                    apply_mode(HistoryListMode::AudioFiles);
+                }
+            });
+        }
+    }
+
+    // =====================================================================
+    // Load external audio file → transcribe → write .md beside source
+    // =====================================================================
+    {
+        let model = model.clone();
+        let list_box = list_box.clone();
+        let metadata_line = metadata_line.clone();
+        let transcription_subtitle = transcription_subtitle.clone();
+        let original_raw_label = original_raw_card.1.clone();
+        let cleanup_subtitle = cleanup_subtitle.clone();
+        let original_cleaned_label = original_cleaned_card.1.clone();
+        let diarization_container = diarization_container.clone();
+        let use_ocr_check = use_ocr_check.clone();
+        let play_button = play_button.clone();
+        let rerun_button = rerun_button.clone();
+        let rerun_cleanup_button = rerun_cleanup_button.clone();
+        let rerun_raw_card_frame = rerun_raw_card.0.clone();
+        let rerun_cleaned_card_frame = rerun_cleaned_card.0.clone();
+        let cleanup_timing_label = cleanup_timing_label.clone();
+        let load_status = load_status.clone();
+        let audio_files_toggle = audio_files_toggle.clone();
+
+        load_audio_button.connect_clicked(move |button| {
+            let parent = button
+                .root()
+                .and_then(|root| root.downcast::<gtk::Window>().ok());
+
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("WAV audio"));
+            filter.add_mime_type("audio/wav");
+            filter.add_mime_type("audio/x-wav");
+            filter.add_pattern("*.wav");
+            filter.add_pattern("*.WAV");
+
+            let filters = gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+
+            let dialog = gtk::FileDialog::builder()
+                .title("Load audio file")
+                .modal(true)
+                .filters(&filters)
+                .default_filter(&filter)
+                .build();
+
+            let model = model.clone();
+            let list_box = list_box.clone();
+            let metadata_line = metadata_line.clone();
+            let transcription_subtitle = transcription_subtitle.clone();
+            let original_raw_label = original_raw_label.clone();
+            let cleanup_subtitle = cleanup_subtitle.clone();
+            let original_cleaned_label = original_cleaned_label.clone();
+            let diarization_container = diarization_container.clone();
+            let use_ocr_check = use_ocr_check.clone();
+            let play_button = play_button.clone();
+            let rerun_button = rerun_button.clone();
+            let rerun_cleanup_button = rerun_cleanup_button.clone();
+            let rerun_raw_card_frame = rerun_raw_card_frame.clone();
+            let rerun_cleaned_card_frame = rerun_cleaned_card_frame.clone();
+            let cleanup_timing_label = cleanup_timing_label.clone();
+            let load_status = load_status.clone();
+            let audio_files_toggle = audio_files_toggle.clone();
+            let load_audio_button = button.clone();
+
+            dialog.open(
+                parent.as_ref(),
+                None::<&gio::Cancellable>,
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(path) = file.path() else {
+                        load_status.set_label("Could not read selected path.");
+                        return;
+                    };
+                    if !is_supported_audio_path(&path) {
+                        load_status.set_label("Only WAV audio files are supported.");
+                        return;
+                    }
+
+                    load_status.set_label(&format!("Transcribing {}…", display_file_name(&path)));
+                    load_audio_button.set_sensitive(false);
+
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let path_for_thread = path.clone();
+                    std::thread::Builder::new()
+                        .name("pepperx-audio-import".into())
+                        .spawn(move || {
+                            let result =
+                                crate::transcription::import_external_audio_file(&path_for_thread);
+                            let _ = tx.send(result);
+                        })
+                        .expect("failed to spawn audio import thread");
+
+                    let model = model.clone();
+                    let list_box = list_box.clone();
+                    let metadata_line = metadata_line.clone();
+                    let transcription_subtitle = transcription_subtitle.clone();
+                    let original_raw_label = original_raw_label.clone();
+                    let cleanup_subtitle = cleanup_subtitle.clone();
+                    let original_cleaned_label = original_cleaned_label.clone();
+                    let diarization_container = diarization_container.clone();
+                    let use_ocr_check = use_ocr_check.clone();
+                    let play_button = play_button.clone();
+                    let rerun_button = rerun_button.clone();
+                    let rerun_cleanup_button = rerun_cleanup_button.clone();
+                    let rerun_raw_card_frame = rerun_raw_card_frame.clone();
+                    let rerun_cleaned_card_frame = rerun_cleaned_card_frame.clone();
+                    let cleanup_timing_label = cleanup_timing_label.clone();
+                    let load_status = load_status.clone();
+                    let audio_files_toggle = audio_files_toggle.clone();
+                    let load_audio_button = load_audio_button.clone();
+                    let source_path = path;
+
+                    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                        match rx.try_recv() {
+                            Ok(Ok(import)) => {
+                                load_audio_button.set_sensitive(true);
+                                let md_name = import
+                                    .markdown_path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("transcript.md");
+                                load_status.set_label(&format!(
+                                    "Saved {md_name} next to {}.",
+                                    display_file_name(&source_path)
+                                ));
+
+                                // Prefer Audio files mode after a successful import.
+                                if !audio_files_toggle.is_active() {
+                                    // Grouped toggle: activating Audio files deactivates Recordings.
+                                    audio_files_toggle.set_active(true);
+                                }
+
+                                let refreshed = HistoryStore::open(state_root())
+                                    .and_then(|store| store.recent_runs())
+                                    .unwrap_or_default();
+                                {
+                                    let mut model = model.borrow_mut();
+                                    model.replace_all_runs(refreshed);
+                                    model.set_mode(HistoryListMode::AudioFiles);
+                                }
+                                rebuild_history_list_ui(
+                                    &model,
+                                    &list_box,
+                                    &metadata_line,
+                                    &transcription_subtitle,
+                                    &original_raw_label,
+                                    &cleanup_subtitle,
+                                    &original_cleaned_label,
+                                    &diarization_container,
+                                    &use_ocr_check,
+                                    &play_button,
+                                    &rerun_button,
+                                    &rerun_cleanup_button,
+                                    &rerun_raw_card_frame,
+                                    &rerun_cleaned_card_frame,
+                                    &cleanup_timing_label,
+                                );
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Err(error)) => {
+                                load_audio_button.set_sensitive(true);
+                                load_status.set_label(&format!("Import failed: {error}"));
+                                glib::ControlFlow::Break
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                glib::ControlFlow::Continue
+                            }
+                            Err(_) => {
+                                load_audio_button.set_sensitive(true);
+                                load_status.set_label("Import failed: worker channel closed.");
+                                glib::ControlFlow::Break
+                            }
+                        }
+                    });
+                },
+            );
+        });
+    }
+
+    // =====================================================================
     // Paned: list on left, scrollable detail on right
     // =====================================================================
     let details_scroll = gtk::ScrolledWindow::new();
     details_scroll.set_policy(PolicyType::Never, PolicyType::Automatic);
     details_scroll.set_child(Some(&details_box));
+    details_scroll.set_hexpand(true);
+    details_scroll.set_vexpand(true);
 
     let list_scroll = gtk::ScrolledWindow::new();
     list_scroll.set_min_content_width(280);
@@ -591,9 +966,107 @@ pub(crate) fn build_history_browser(
     let browser = gtk::Paned::new(Orientation::Horizontal);
     browser.set_wide_handle(true);
     browser.set_position(300);
+    browser.set_hexpand(true);
+    browser.set_vexpand(true);
     browser.set_start_child(Some(&list_scroll));
     browser.set_end_child(Some(&details_scroll));
-    browser
+
+    let root = gtk::Box::new(Orientation::Vertical, 0);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    root.append(&toolbar);
+    root.append(&browser);
+    root
+}
+
+fn rebuild_history_list_ui(
+    model: &Rc<RefCell<HistoryBrowserModel>>,
+    list_box: &gtk::ListBox,
+    metadata_line: &gtk::Label,
+    transcription_subtitle: &gtk::Label,
+    original_raw_label: &gtk::Label,
+    cleanup_subtitle: &gtk::Label,
+    original_cleaned_label: &gtk::Label,
+    diarization_container: &gtk::Box,
+    use_ocr_check: &gtk::CheckButton,
+    play_button: &gtk::Button,
+    rerun_button: &gtk::Button,
+    rerun_cleanup_button: &gtk::Button,
+    rerun_raw_card_frame: &gtk::Frame,
+    rerun_cleaned_card_frame: &gtk::Frame,
+    cleanup_timing_label: &gtk::Label,
+) {
+    while let Some(child) = list_box.first_child() {
+        list_box.remove(&child);
+    }
+
+    let model_ref = model.borrow();
+    for run in &model_ref.runs {
+        list_box.append(&build_history_row(run));
+    }
+
+    rerun_raw_card_frame.set_visible(false);
+    rerun_cleaned_card_frame.set_visible(false);
+    cleanup_timing_label.set_visible(false);
+
+    if let Some(run) = model_ref.selected_run().cloned() {
+        drop(model_ref);
+        let model_ref = model.borrow();
+        populate_detail_for_run(
+            &run,
+            metadata_line,
+            transcription_subtitle,
+            original_raw_label,
+            cleanup_subtitle,
+            original_cleaned_label,
+            diarization_container,
+            model_ref.selected_recording_duration_secs(),
+            use_ocr_check,
+        );
+        play_button.set_sensitive(model_ref.selected_wav_path().is_some());
+        rerun_button.set_sensitive(model_ref.rerunnable_run_id().is_some());
+        rerun_cleanup_button.set_sensitive(model_ref.cleanup_rerunnable_run_id().is_some());
+        drop(model_ref);
+        if let Some(first_row) = list_box.row_at_index(0) {
+            let selected_index = model.borrow().selected_index();
+            if let Some(row) = list_box.row_at_index(selected_index as i32) {
+                list_box.select_row(Some(&row));
+            } else {
+                list_box.select_row(Some(&first_row));
+            }
+        }
+    } else {
+        drop(model_ref);
+        metadata_line.set_label("");
+        transcription_subtitle.set_label("");
+        original_raw_label.set_label(match model.borrow().mode() {
+            HistoryListMode::Recordings => "No recordings yet.",
+            HistoryListMode::AudioFiles => {
+                "No audio files yet. Use “Load audio file” to transcribe a WAV."
+            }
+        });
+        cleanup_subtitle.set_label("");
+        original_cleaned_label.set_label("No cleanup transcript for this run.");
+        clear_diarization_container(diarization_container);
+        use_ocr_check.set_visible(false);
+        play_button.set_sensitive(false);
+        rerun_button.set_sensitive(false);
+        rerun_cleanup_button.set_sensitive(false);
+    }
+}
+
+fn is_supported_audio_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false)
+}
+
+fn display_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("audio")
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,7 +1866,15 @@ mod history_view_tests {
             run_dir: PathBuf::from(format!("/tmp/history/{run_id}")),
             metadata_path: PathBuf::from(format!("/tmp/history/{run_id}/run.json")),
             entry,
-            runtime_metadata: RunRuntimeMetadata::wav_import(),
+            // Tests exercise the Recordings tab by default.
+            runtime_metadata: RunRuntimeMetadata {
+                input_origin: "live-recording".into(),
+                trigger_source: Some("shell-action".into()),
+                selected_microphone: None,
+                recording_elapsed_ms: Some(2900),
+                failure_stage: None,
+                failure_reason: None,
+            },
             archived_source_wav_path: Some(PathBuf::from(format!(
                 "/tmp/history/{run_id}/source.wav"
             ))),
@@ -1402,6 +1883,18 @@ mod history_view_tests {
             supporting_context_text: None,
             ocr_text: None,
         }
+    }
+
+    fn audio_import_run(
+        run_id: &str,
+        archived_at_ms: u64,
+        raw: &str,
+        cleaned: Option<&str>,
+        insertion_backend: &str,
+    ) -> ArchivedRun {
+        let mut run = archived_run(run_id, archived_at_ms, raw, cleaned, insertion_backend);
+        run.runtime_metadata = RunRuntimeMetadata::wav_import();
+        run
     }
 
     #[test]
@@ -1703,6 +2196,43 @@ mod history_view_tests {
 
         let model = HistoryBrowserModel::new(vec![run]);
         assert!(model.selected_wav_path().is_none());
+    }
+
+    #[test]
+    fn history_mode_toggle_separates_recordings_and_audio_imports() {
+        let recording = archived_run(
+            "run-live",
+            30,
+            "live dictation",
+            Some("Live dictation."),
+            "atspi-editable-text",
+        );
+        let import = audio_import_run(
+            "run-import",
+            40,
+            "external audio",
+            Some("External audio."),
+            "atspi-editable-text",
+        );
+        let mut model = HistoryBrowserModel::new(vec![recording, import]);
+
+        assert_eq!(model.mode(), HistoryListMode::Recordings);
+        assert_eq!(model.visible_run_ids(), vec!["run-live".to_string()]);
+
+        model.set_mode(HistoryListMode::AudioFiles);
+        assert_eq!(model.visible_run_ids(), vec!["run-import".to_string()]);
+        assert_eq!(model.selected_run_id(), Some("run-import"));
+
+        model.set_mode(HistoryListMode::Recordings);
+        assert_eq!(model.visible_run_ids(), vec!["run-live".to_string()]);
+    }
+
+    #[test]
+    fn is_supported_audio_path_accepts_wav_only() {
+        assert!(is_supported_audio_path(Path::new("/tmp/note.wav")));
+        assert!(is_supported_audio_path(Path::new("/tmp/NOTE.WAV")));
+        assert!(!is_supported_audio_path(Path::new("/tmp/note.mp3")));
+        assert!(!is_supported_audio_path(Path::new("/tmp/note")));
     }
 
     #[test]
