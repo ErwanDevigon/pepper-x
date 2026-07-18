@@ -39,8 +39,34 @@ pub struct CatalogModel {
     pub download_files: &'static [(&'static str, &'static str)],
 }
 
-const SUPPORTED_MODELS: [CatalogModel; 5] = [
-    // Default ASR: Nemotron streaming int8 (parakeet-rs)
+const SUPPORTED_MODELS: [CatalogModel; 6] = [
+    // Default ASR: Nemotron 3.5 multilingual int8 (parakeet-rs / smcleod)
+    // Matches the model selected by users on the multilingual / all-features branch.
+    CatalogModel {
+        id: "nemotron-3.5-asr-streaming-0.6b-int8",
+        kind: ModelKind::Asr,
+        install_path: "asr/nemotron-3.5-asr-streaming-0.6b-int8",
+        required_files: &[
+            "encoder.onnx",
+            "encoder.onnx.data",
+            "decoder_joint.onnx",
+            "tokenizer.model",
+        ],
+        install_layout: InstallLayout::Directory,
+        download_artifact: DownloadArtifact {
+            url: "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/",
+            file_name: "",
+            kind: DownloadArtifactKind::MultiFile,
+            strip_prefix: None,
+        },
+        download_files: &[
+            ("encoder.onnx", "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/encoder.onnx"),
+            ("encoder.onnx.data", "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/encoder.onnx.data"),
+            ("decoder_joint.onnx", "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/decoder_joint.onnx"),
+            ("tokenizer.model", "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/tokenizer.model"),
+        ],
+    },
+    // Legacy ASR: English-only Nemotron streaming int8
     CatalogModel {
         id: "nemotron-speech-streaming-en-0.6b",
         kind: ModelKind::Asr,

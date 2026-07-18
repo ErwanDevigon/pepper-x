@@ -673,7 +673,7 @@ mod tests {
             .iter()
             .any(|snapshot| snapshot.model_states.iter().any(|state| {
                 state.phase == BootstrapModelPhase::Downloading
-                    && state.model_id == "nemotron-speech-streaming-en-0.6b"
+                    && state.model_id == "nemotron-3.5-asr-streaming-0.6b-int8"
             })));
         assert!(snapshots
             .last()
@@ -682,7 +682,7 @@ mod tests {
             .iter()
             .any(|state| {
                 state.phase == BootstrapModelPhase::Failed
-                    && state.model_id == "nemotron-speech-streaming-en-0.6b"
+                    && state.model_id == "nemotron-3.5-asr-streaming-0.6b-int8"
             }));
         let _ = std::fs::remove_dir_all(root);
     }

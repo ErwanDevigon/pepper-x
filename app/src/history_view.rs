@@ -872,7 +872,9 @@ pub(crate) fn build_history_browser(
                         return;
                     };
                     if !is_supported_audio_path(&path) {
-                        load_status.set_label("Only WAV audio files are supported.");
+                        load_status.set_label(
+                            "Unsupported audio type. Use WAV, MP3, FLAC, OGG, AAC/M4A…",
+                        );
                         return;
                     }
 

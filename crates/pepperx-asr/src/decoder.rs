@@ -216,6 +216,98 @@ pub fn decode_audio_file(path: &Path) -> Result<DecodedAudio, DecodeError> {
     })
 }
 
+/// Decode any supported audio file and write a temporary mono 16 kHz 16-bit PCM WAV.
+///
+/// Used by History import so Nemotron always sees a canonical WAV, regardless of
+/// the source container (FLAC/MP3/OGG/…). Caller owns cleanup of the returned path
+/// (see [`TempMonoWav`]).
+pub fn convert_to_temp_mono_16k_wav(path: &Path) -> Result<TempMonoWav, DecodeError> {
+    let decoded = decode_audio_file(path)?;
+    write_temp_mono_16k_wav(&decoded, path)
+}
+
+/// RAII guard for a temporary mono 16 kHz WAV produced for ASR.
+#[derive(Debug)]
+pub struct TempMonoWav {
+    pub path: PathBuf,
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+}
+
+impl TempMonoWav {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempMonoWav {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn write_temp_mono_16k_wav(
+    decoded: &DecodedAudio,
+    source_path: &Path,
+) -> Result<TempMonoWav, DecodeError> {
+    let stem = source_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("audio");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "pepper-x-import-{}-{}-{unique}.wav",
+        sanitize_stem(stem),
+        std::process::id()
+    ));
+
+    write_mono_16k_wav(&path, &decoded.samples).map_err(|detail| DecodeError::DecodeFailed {
+        path: source_path.to_path_buf(),
+        detail: format!("failed to write temp mono WAV {}: {detail}", path.display()),
+    })?;
+
+    Ok(TempMonoWav {
+        path,
+        samples: decoded.samples.clone(),
+        sample_rate: decoded.sample_rate,
+    })
+}
+
+/// Write mono PCM as 16-bit integer WAV at [`TARGET_SAMPLE_RATE`].
+pub fn write_mono_16k_wav(path: &Path, samples: &[f32]) -> Result<(), String> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: TARGET_SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).map_err(|e| e.to_string())?;
+    for &sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let amplitude = (clamped * i16::MAX as f32).round() as i16;
+        writer.write_sample(amplitude).map_err(|e| e.to_string())?;
+    }
+    writer.finalize().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn sanitize_stem(stem: &str) -> String {
+    stem.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect()
+}
+
 /// Mix interleaved multi-channel samples down to mono by averaging channels.
 fn mix_to_mono(interleaved: &[f32], channel_count: usize) -> Vec<f32> {
     if channel_count <= 1 {
@@ -387,6 +479,25 @@ mod tests {
     fn decode_missing_file_errors() {
         let err = decode_audio_file(Path::new("/tmp/pepper-x-missing-audio-xyz.wav")).unwrap_err();
         assert!(matches!(err, DecodeError::MissingFile(_)));
+    }
+
+    #[test]
+    fn convert_to_temp_mono_16k_wav_writes_canonical_wav() {
+        let root = unique_tmp("temp-wav");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("stereo.wav");
+        write_sine_wav(&source, 48_000, 2, 0.05);
+
+        let temp = convert_to_temp_mono_16k_wav(&source).expect("convert");
+        assert!(temp.path.is_file());
+        assert_eq!(temp.sample_rate, TARGET_SAMPLE_RATE);
+
+        let reader = hound::WavReader::open(temp.path()).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, TARGET_SAMPLE_RATE);
+        assert_eq!(spec.bits_per_sample, 16);
+        drop(temp);
     }
 
     fn write_sine_wav(path: &Path, sample_rate: u32, channels: u16, duration_secs: f32) {

@@ -51,6 +51,11 @@ pub enum TranscriptionError {
         missing_file: &'static str,
     },
     InvalidWaveFile(PathBuf),
+    /// Decode/convert failed; `detail` is human-readable (format, I/O, empty, …).
+    AudioDecodeFailed {
+        path: PathBuf,
+        detail: String,
+    },
     RecognizerInitializationFailed(PathBuf),
     DecodeFailed(PathBuf),
 }
@@ -73,11 +78,13 @@ pub fn transcribe_wav(
         TranscriptionError::RecognizerInitializationFailed(request.model_dir.clone())
     })?;
 
-    let canonical_wav_path = std::fs::canonicalize(&request.wav_path)
+    let canonical_source_path = std::fs::canonicalize(&request.wav_path)
         .map_err(|_| TranscriptionError::MissingWavFile(request.wav_path.clone()))?;
 
+    // Always normalize through mono 16 kHz PCM (in-memory). For non-WAV sources
+    // this is required; for multi-rate/multi-channel WAV it is also required.
     let decoded =
-        decode_audio_file(&canonical_wav_path).map_err(|error| map_decode_error(error))?;
+        decode_audio_file(&canonical_source_path).map_err(|error| map_decode_error(error))?;
     debug_assert_eq!(decoded.sample_rate, TARGET_SAMPLE_RATE);
 
     let start = Instant::now();
@@ -86,7 +93,7 @@ pub fn transcribe_wav(
         .map_err(|_| TranscriptionError::DecodeFailed(request.wav_path.clone()))?;
 
     Ok(TranscriptionResult {
-        wav_path: canonical_wav_path,
+        wav_path: canonical_source_path,
         transcript_text,
         backend_name: BACKEND_NAME.to_string(),
         model_name: request.model_name.clone(),
@@ -211,11 +218,25 @@ fn map_decode_error(error: DecodeError) -> TranscriptionError {
         DecodeError::MissingFile(path) | DecodeError::OpenFailed(path) => {
             TranscriptionError::MissingWavFile(path)
         }
-        DecodeError::UnsupportedFormat(path)
-        | DecodeError::NoAudioTrack(path)
-        | DecodeError::MissingSampleRate(path)
-        | DecodeError::EmptyAudio(path)
-        | DecodeError::DecodeFailed { path, .. } => TranscriptionError::InvalidWaveFile(path),
+        DecodeError::UnsupportedFormat(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "unsupported audio format".into(),
+        },
+        DecodeError::NoAudioTrack(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "no audio track found".into(),
+        },
+        DecodeError::MissingSampleRate(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "missing sample rate metadata".into(),
+        },
+        DecodeError::EmptyAudio(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "decoded audio is empty".into(),
+        },
+        DecodeError::DecodeFailed { path, detail } => {
+            TranscriptionError::AudioDecodeFailed { path, detail }
+        }
     }
 }
 

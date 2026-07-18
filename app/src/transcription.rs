@@ -6,7 +6,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use pepperx_asr::{
-    filter_other_speakers, transcribe_wav, TranscriptionError, TranscriptionRequest,
+    convert_to_temp_mono_16k_wav, filter_other_speakers, transcribe_wav, TranscriptionError,
+    TranscriptionRequest,
     TranscriptionResult,
 };
 use pepperx_audio::RecordingArtifact;
@@ -224,20 +225,62 @@ pub struct ExternalAudioImportResult {
 /// Transcribe an external audio file (WAV/MP3/FLAC/OGG/AAC/…), archive it as a
 /// history run (`wav-import`), and write a Markdown transcript next to the
 /// source audio file.
+///
+/// The source is always converted to a temporary mono 16 kHz WAV before ASR so
+/// Nemotron receives canonical PCM regardless of container (FLAC/MP3/…). The
+/// temp WAV is what gets archived as `source.wav`; the `.md` is written beside
+/// the original user file.
 pub fn import_external_audio_file(
     audio_path: &Path,
 ) -> Result<ExternalAudioImportResult, TranscriptionRunError> {
+    let temp_wav = convert_to_temp_mono_16k_wav(audio_path).map_err(|error| {
+        TranscriptionRunError::Asr(map_import_decode_error(error))
+    })?;
+
     let settings = AppSettings::load_or_default();
-    let entry = if settings.cleanup_enabled {
-        transcribe_wav_and_cleanup_to_log(audio_path)?
+    let mut entry = if settings.cleanup_enabled {
+        transcribe_wav_and_cleanup_to_log(temp_wav.path())?
     } else {
-        transcribe_wav_to_log(audio_path)?
+        transcribe_wav_to_log(temp_wav.path())?
     };
+    // Keep the original path in the transcript entry for display / markdown.
+    entry.source_wav_path = audio_path.to_path_buf();
+
     let markdown_path = write_transcript_markdown_beside_audio(audio_path, &entry)?;
     Ok(ExternalAudioImportResult {
         entry,
         markdown_path,
     })
+}
+
+fn map_import_decode_error(error: pepperx_asr::DecodeError) -> TranscriptionError {
+    match error {
+        pepperx_asr::DecodeError::MissingFile(path)
+        | pepperx_asr::DecodeError::OpenFailed(path) => TranscriptionError::MissingWavFile(path),
+        pepperx_asr::DecodeError::UnsupportedFormat(path) => {
+            TranscriptionError::AudioDecodeFailed {
+                path,
+                detail: "unsupported audio format".into(),
+            }
+        }
+        pepperx_asr::DecodeError::NoAudioTrack(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "no audio track found".into(),
+        },
+        pepperx_asr::DecodeError::MissingSampleRate(path) => {
+            TranscriptionError::AudioDecodeFailed {
+                path,
+                detail: "missing sample rate metadata".into(),
+            }
+        }
+        pepperx_asr::DecodeError::EmptyAudio(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "decoded audio is empty".into(),
+        },
+        pepperx_asr::DecodeError::DecodeFailed { path, detail } => {
+            TranscriptionError::AudioDecodeFailed { path, detail }
+        }
+    }
 }
 
 /// Markdown path beside the audio: `meeting.wav` → `meeting.md`.
@@ -1597,6 +1640,9 @@ fn describe_asr_error(error: &TranscriptionError) -> String {
         ),
         TranscriptionError::InvalidWaveFile(path) => {
             format!("invalid or unsupported audio file: {}", path.display())
+        }
+        TranscriptionError::AudioDecodeFailed { path, detail } => {
+            format!("audio convert/decode failed for {}: {detail}", path.display())
         }
         TranscriptionError::RecognizerInitializationFailed(model_dir) => format!(
             "failed to initialize recognizer from {}",
