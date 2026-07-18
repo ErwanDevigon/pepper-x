@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use crate::app_model::SettingsSurfaceState;
 use crate::settings::{
-    corrections_store_path, load_microphone_ui_state, save_launch_at_login,
-    save_preferred_microphone, AppSettings, MicrophoneUiState,
+    asr_model_is_multilingual, corrections_store_path, load_microphone_ui_state,
+    resolve_asr_language, save_launch_at_login, save_preferred_microphone, AppSettings,
+    MicrophoneUiState, ASR_LANGUAGE_OPTIONS,
 };
 use crate::transcript_log::TranscriptEntry;
 use pepperx_corrections::CorrectionStore;
@@ -102,6 +103,9 @@ pub struct SettingsView {
     root: gtk::Box,
     asr_model_dropdown: gtk::DropDown,
     asr_model_ids: Vec<String>,
+    asr_language_dropdown: gtk::DropDown,
+    asr_language_row: adw::ActionRow,
+    asr_language_codes: Vec<String>,
     cleanup_switch: gtk::Switch,
     cleanup_use_gpu_switch: gtk::Switch,
     cleanup_gpu_layers_row: adw::ActionRow,
@@ -499,6 +503,34 @@ impl SettingsView {
         asr_model_row.add_suffix(&asr_model_dropdown);
         models_list.append(&list_box_row(&asr_model_row));
 
+        let asr_language_labels: Vec<&str> = ASR_LANGUAGE_OPTIONS
+            .iter()
+            .map(|(_, label)| *label)
+            .collect();
+        let asr_language_codes: Vec<&str> = ASR_LANGUAGE_OPTIONS
+            .iter()
+            .map(|(code, _)| *code)
+            .collect();
+        let asr_language_list = gtk::StringList::new(&asr_language_labels);
+        let asr_language_dropdown =
+            gtk::DropDown::new(Some(asr_language_list), None::<gtk::Expression>);
+        asr_language_dropdown.set_hexpand(true);
+        let resolved_lang = resolve_asr_language(&surface_state.preferred_asr_language);
+        let asr_language_index = asr_language_codes
+            .iter()
+            .position(|code| *code == resolved_lang)
+            .unwrap_or(0);
+        asr_language_dropdown.set_selected(asr_language_index as u32);
+        let multilingual = asr_model_is_multilingual(&surface_state.preferred_asr_model);
+        asr_language_dropdown.set_sensitive(multilingual);
+        let asr_language_row = adw::ActionRow::builder()
+            .title("Transcription language")
+            .subtitle("Target language for multilingual Nemotron (ignored on English-only models)")
+            .sensitive(multilingual)
+            .build();
+        asr_language_row.add_suffix(&asr_language_dropdown);
+        models_list.append(&list_box_row(&asr_language_row));
+
         let cleanup_model_ids: Vec<&str> = supported_models()
             .iter()
             .filter(|m| m.kind == ModelKind::Cleanup)
@@ -709,6 +741,9 @@ impl SettingsView {
             root,
             asr_model_dropdown,
             asr_model_ids: asr_model_ids.iter().map(|s| s.to_string()).collect(),
+            asr_language_dropdown,
+            asr_language_row,
+            asr_language_codes: asr_language_codes.iter().map(|s| s.to_string()).collect(),
             cleanup_switch,
             cleanup_use_gpu_switch,
             cleanup_gpu_layers_row,
@@ -795,6 +830,24 @@ impl SettingsView {
             .set_sensitive(surface_state.cleanup_enabled);
         self.prompt_profile_dropdown
             .set_selected(prompt_profile_index(&surface_state.cleanup_prompt_profile));
+        if let Some(index) = self
+            .asr_model_ids
+            .iter()
+            .position(|id| id == &surface_state.preferred_asr_model)
+        {
+            self.asr_model_dropdown.set_selected(index as u32);
+        }
+        let resolved_lang = resolve_asr_language(&surface_state.preferred_asr_language);
+        if let Some(index) = self
+            .asr_language_codes
+            .iter()
+            .position(|code| code == resolved_lang)
+        {
+            self.asr_language_dropdown.set_selected(index as u32);
+        }
+        let multilingual = asr_model_is_multilingual(&surface_state.preferred_asr_model);
+        self.asr_language_dropdown.set_sensitive(multilingual);
+        self.asr_language_row.set_sensitive(multilingual);
         self.hold_trigger_button
             .set_label(&trigger_keys_display_name(&surface_state.hold_trigger_keys));
         *self.hold_trigger_value.borrow_mut() =
@@ -840,6 +893,8 @@ impl SettingsView {
         self.asr_model_dropdown.connect_selected_notify({
             let updating_settings = self.updating_settings.clone();
             let asr_model_ids = asr_model_ids.clone();
+            let asr_language_dropdown = self.asr_language_dropdown.clone();
+            let asr_language_row = self.asr_language_row.clone();
             let feedback_label = self.feedback_label.clone();
             move |dropdown| {
                 if updating_settings.get() {
@@ -849,8 +904,36 @@ impl SettingsView {
                 let index = dropdown.selected() as usize;
                 if let Some(model_id) = asr_model_ids.get(index) {
                     let model_id = model_id.clone();
+                    let multilingual = asr_model_is_multilingual(&model_id);
+                    asr_language_dropdown.set_sensitive(multilingual);
+                    asr_language_row.set_sensitive(multilingual);
                     if let Err(error) = save_settings_change(move |settings| {
                         settings.preferred_asr_model = model_id;
+                    }) {
+                        feedback_label.set_label(&format!("Failed to save settings: {error}"));
+                        feedback_label.set_visible(true);
+                    } else {
+                        feedback_label.set_label("Saved settings");
+                        feedback_label.set_visible(true);
+                    }
+                }
+            }
+        });
+
+        self.asr_language_dropdown.connect_selected_notify({
+            let updating_settings = self.updating_settings.clone();
+            let asr_language_codes = self.asr_language_codes.clone();
+            let feedback_label = self.feedback_label.clone();
+            move |dropdown| {
+                if updating_settings.get() {
+                    return;
+                }
+
+                let index = dropdown.selected() as usize;
+                if let Some(lang) = asr_language_codes.get(index) {
+                    let lang = lang.clone();
+                    if let Err(error) = save_settings_change(move |settings| {
+                        settings.preferred_asr_language = lang;
                     }) {
                         feedback_label.set_label(&format!("Failed to save settings: {error}"));
                         feedback_label.set_visible(true);
@@ -1550,6 +1633,18 @@ pub fn settings_form_sections(surface_state: &SettingsSurfaceState) -> Vec<Setti
                         .map(|m| m.id.to_string())
                         .collect(),
                     enabled: true,
+                }),
+                SettingsControl::Select(SettingsSelectControl {
+                    title: "Transcription language".into(),
+                    subtitle: "Target language for multilingual Nemotron (ignored on English-only models)"
+                        .into(),
+                    selected: resolve_asr_language(&surface_state.preferred_asr_language)
+                        .to_string(),
+                    options: ASR_LANGUAGE_OPTIONS
+                        .iter()
+                        .map(|(code, _)| (*code).to_string())
+                        .collect(),
+                    enabled: asr_model_is_multilingual(&surface_state.preferred_asr_model),
                 }),
                 SettingsControl::Select(SettingsSelectControl {
                     title: "Cleanup model".into(),

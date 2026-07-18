@@ -683,6 +683,7 @@ mod app_shell {
             cleanup_gpu_layers: 0,
             preferred_asr_model: "nemo-parakeet-tdt-0.6b-v3-int8".into(),
             preferred_cleanup_model: "qwen3.5-2b-q4_k_m.gguf".into(),
+            preferred_asr_language: "fr-FR".into(),
             cleanup_prompt_profile: "ordinary-dictation".into(),
             cleanup_custom_prompt: String::from("settings v1"),
             launch_at_login: false,
@@ -735,6 +736,7 @@ mod app_shell {
             cleanup_gpu_layers: 0,
             preferred_asr_model: "nemo-parakeet-tdt-0.6b-v3-int8".into(),
             preferred_cleanup_model: "qwen3.5-2b-q4_k_m.gguf".into(),
+            preferred_asr_language: "en-US".into(),
             cleanup_prompt_profile: "literal-dictation".into(),
             cleanup_custom_prompt: String::from("settings v2"),
             launch_at_login: true,
@@ -784,6 +786,7 @@ mod app_shell {
             cleanup_gpu_layers: 0,
             preferred_asr_model: "nemo-parakeet-tdt-0.6b-v3-int8".into(),
             preferred_cleanup_model: "qwen3.5-2b-q4_k_m.gguf".into(),
+            preferred_asr_language: "fr-FR".into(),
             cleanup_prompt_profile: "ordinary-dictation".into(),
             cleanup_custom_prompt: "Keep Linux app names verbatim.".into(),
             launch_at_login: true,
@@ -934,6 +937,15 @@ mod app_shell {
         ));
         assert!(matches!(
             &scaffold.sections[3].controls[1],
+            SettingsControl::Select(SettingsSelectControl {
+                title,
+                selected,
+                enabled: false,
+                ..
+            }) if title == "Transcription language" && selected == "fr-FR"
+        ));
+        assert!(matches!(
+            &scaffold.sections[3].controls[2],
             SettingsControl::Select(SettingsSelectControl {
                 title,
                 ..
