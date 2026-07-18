@@ -327,14 +327,145 @@ fn mix_to_mono(interleaved: &[f32], channel_count: usize) -> Vec<f32> {
     mono
 }
 
-/// Linear-interpolation resampler for mono PCM.
+/// Minimum input length before we fan out across rayon workers.
+/// Below this, single-thread rubato is cheaper (no spawn / join overhead).
+const PARALLEL_RESAMPLE_THRESHOLD: usize = 240_000; // ~5 s @ 48 kHz
+
+/// Input chunk size for parallel segments (~2 s @ 48 kHz).
+const PARALLEL_CHUNK_INPUT: usize = 96_000;
+
+/// Rubato FFT chunk size (frames). Good speed/quality tradeoff for speech.
+const RUBATO_CHUNK_FRAMES: usize = 1024;
+
+/// High-quality mono resampler (rubato FFT).
 ///
-/// Sufficient for speech ASR; keeps the dependency surface pure-Rust and small.
+/// Large clips are split into independent chunks and resampled in parallel with
+/// rayon — each worker owns its own [`FftFixedIn`] so there is no shared state.
+/// Short clips stay single-threaded to avoid thread-pool overhead.
 pub fn resample_mono(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if samples.is_empty() {
+    if samples.is_empty() || from_rate == 0 || to_rate == 0 {
         return Vec::new();
     }
-    if from_rate == 0 || to_rate == 0 {
+    if from_rate == to_rate {
+        return samples.to_vec();
+    }
+
+    if samples.len() < PARALLEL_RESAMPLE_THRESHOLD || rayon::current_num_threads() <= 1 {
+        return resample_mono_rubato(samples, from_rate, to_rate)
+            .unwrap_or_else(|_| resample_mono_linear(samples, from_rate, to_rate));
+    }
+
+    resample_mono_parallel(samples, from_rate, to_rate)
+}
+
+fn resample_mono_parallel(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    use rayon::prelude::*;
+
+    let chunk_in = PARALLEL_CHUNK_INPUT.max(RUBATO_CHUNK_FRAMES * 4);
+    // Overlap so filter warm-up at segment edges is discarded (speech-safe).
+    let overlap = (from_rate as usize / 20).max(512).min(chunk_in / 4); // ~50 ms
+    let ratio = f64::from(to_rate) / f64::from(from_rate);
+
+    let starts: Vec<usize> = (0..samples.len()).step_by(chunk_in).collect();
+    let pieces: Vec<Vec<f32>> = starts
+        .into_par_iter()
+        .map(|start| {
+            let end = (start + chunk_in).min(samples.len());
+            let pad_start = start.saturating_sub(overlap);
+            let pad_end = (end + overlap).min(samples.len());
+            let padded = &samples[pad_start..pad_end];
+
+            let resampled = resample_mono_rubato(padded, from_rate, to_rate)
+                .unwrap_or_else(|_| resample_mono_linear(padded, from_rate, to_rate));
+
+            let skip = if start == 0 {
+                0
+            } else {
+                ((start - pad_start) as f64 * ratio).round() as usize
+            };
+            let keep = ((end - start) as f64 * ratio).round() as usize;
+            let slice_start = skip.min(resampled.len());
+            let slice_end = (slice_start + keep).min(resampled.len());
+            resampled[slice_start..slice_end].to_vec()
+        })
+        .collect();
+
+    let expected = ((samples.len() as f64) * ratio).round().max(1.0) as usize;
+    let mut out = Vec::with_capacity(expected);
+    for piece in pieces {
+        out.extend_from_slice(&piece);
+    }
+    // Length can drift by a few samples from rounding; trim or pad for stability.
+    if out.len() > expected {
+        out.truncate(expected);
+    } else if out.len() < expected {
+        out.resize(expected, 0.0);
+    }
+    out
+}
+
+/// Offline rubato FFT resample following the crate's recommended clip procedure.
+fn resample_mono_rubato(
+    samples: &[f32],
+    from_rate: u32,
+    to_rate: u32,
+) -> Result<Vec<f32>, String> {
+    use rubato::{FftFixedIn, Resampler};
+
+    let from = from_rate as usize;
+    let to = to_rate as usize;
+    let mut resampler = FftFixedIn::<f32>::new(from, to, RUBATO_CHUNK_FRAMES, 2, 1)
+        .map_err(|error| error.to_string())?;
+
+    let delay = resampler.output_delay();
+    let new_length = ((samples.len() as f64) * (to as f64) / (from as f64))
+        .round()
+        .max(1.0) as usize;
+    let mut output = Vec::with_capacity(new_length + delay + RUBATO_CHUNK_FRAMES);
+    let mut pos = 0;
+
+    // Bulk of the clip: full input frames.
+    loop {
+        let needed = resampler.input_frames_next();
+        if needed == 0 || pos + needed > samples.len() {
+            break;
+        }
+        let chunk = &samples[pos..pos + needed];
+        let waves_out = resampler
+            .process(&[chunk], None)
+            .map_err(|error| error.to_string())?;
+        output.extend_from_slice(&waves_out[0]);
+        pos += needed;
+    }
+
+    // Remainder of the clip.
+    if pos < samples.len() {
+        let rem = &samples[pos..];
+        let waves_out = resampler
+            .process_partial(Some(&[rem]), None)
+            .map_err(|error| error.to_string())?;
+        output.extend_from_slice(&waves_out[0]);
+    }
+
+    // Drain internal delay buffers.
+    while output.len() < new_length + delay {
+        let waves_out = resampler
+            .process_partial(None::<&[&[f32]]>, None)
+            .map_err(|error| error.to_string())?;
+        if waves_out[0].is_empty() {
+            break;
+        }
+        output.extend_from_slice(&waves_out[0]);
+    }
+
+    let start = delay.min(output.len());
+    let end = (start + new_length).min(output.len());
+    Ok(output[start..end].to_vec())
+}
+
+/// Fallback linear resampler if rubato construction/process fails.
+fn resample_mono_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if samples.is_empty() || from_rate == 0 || to_rate == 0 {
         return Vec::new();
     }
     if from_rate == to_rate {
@@ -442,10 +573,19 @@ mod tests {
 
     #[test]
     fn resample_mono_downsamples_length() {
-        // 32 kHz → 16 kHz: roughly half the samples.
-        let samples: Vec<f32> = (0..320).map(|i| (i as f32) / 320.0).collect();
+        // 32 kHz → 16 kHz: roughly half the samples (short = sequential path).
+        let samples: Vec<f32> = (0..32_000).map(|i| (i as f32 * 0.001).sin()).collect();
         let out = resample_mono(&samples, 32_000, 16_000);
-        assert!((out.len() as i32 - 160).abs() <= 1);
+        assert!((out.len() as i32 - 16_000).abs() <= 8, "len={}", out.len());
+    }
+
+    #[test]
+    fn resample_mono_parallel_path_matches_expected_length() {
+        // Above PARALLEL_RESAMPLE_THRESHOLD so rayon path is used when threads > 1.
+        let samples: Vec<f32> = (0..300_000).map(|i| (i as f32 * 0.0005).sin()).collect();
+        let out = resample_mono(&samples, 48_000, 16_000);
+        let expected = ((300_000.0_f64) * 16_000.0 / 48_000.0).round() as i32;
+        assert!((out.len() as i32 - expected).abs() <= 16, "len={} expected={}", out.len(), expected);
     }
 
     #[test]
