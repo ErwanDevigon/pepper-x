@@ -6,4 +6,20 @@ publish = false
 
 [dependencies]
 hound = "3.5.1"
+# 0.3 for multilingual NemotronMode (all-features stack)
 parakeet-rs = { version = "0.3", default-features = false, features = ["cpu", "ort-defaults"] }
+rayon = "1.12.0"
+rubato = "0.16"
+# Pure-Rust demux/decode for external audio import (WAV/MP3/FLAC/OGG/AAC/…).
+# Live capture still writes 16 kHz mono WAV via PipeWire + hound.
+symphonia = { version = "0.5.4", features = [
+    "aac",
+    "alac",
+    "flac",
+    "isomp4",
+    "mkv",
+    "mp3",
+    "ogg",
+    "pcm",
+    "wav",
+] }

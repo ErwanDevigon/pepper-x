@@ -50,6 +50,9 @@ mod tests {
         let models = supported_models();
 
         assert!(models.iter().any(|model| {
+            model.id == "nemotron-3.5-asr-streaming-0.6b-int8" && model.kind == ModelKind::Asr
+        }));
+        assert!(models.iter().any(|model| {
             model.id == "nemotron-speech-streaming-en-0.6b" && model.kind == ModelKind::Asr
         }));
         assert!(models.iter().any(|model| {

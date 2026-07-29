@@ -1,4 +1,4 @@
-use hound::{SampleFormat, WavReader};
+use crate::decoder::{decode_audio_file, DecodeError, TARGET_SAMPLE_RATE};
 use parakeet_rs::{Nemotron, NemotronMode};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -14,6 +14,7 @@ const STREAMING_CHUNK_SAMPLES: usize = 8960;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptionRequest {
+    /// Source audio path (WAV/MP3/FLAC/OGG/AAC/…). Field name kept for API stability.
     pub wav_path: PathBuf,
     pub model_dir: PathBuf,
     pub model_name: String,
@@ -70,36 +71,52 @@ pub enum TranscriptionError {
         missing_file: &'static str,
     },
     InvalidWaveFile(PathBuf),
+    /// Decode/convert failed; `detail` is human-readable (format, I/O, empty, …).
+    AudioDecodeFailed {
+        path: PathBuf,
+        detail: String,
+    },
     RecognizerInitializationFailed(PathBuf),
     DecodeFailed(PathBuf),
     LanguageConfigFailed(String),
 }
 
 // ---------------------------------------------------------------------------
-// Batch mode -- transcribe a complete WAV file in one shot
+// Batch mode -- transcribe a complete audio file in one shot
 // ---------------------------------------------------------------------------
 
+/// Transcribe an audio file (WAV, MP3, FLAC, OGG, AAC/M4A, …).
+///
+/// Any container supported by Symphonia is decoded to mono PCM at 16 kHz, then
+/// fed to the Nemotron offline path. Live capture still uses WAV via PipeWire.
 pub fn transcribe_wav(
     request: &TranscriptionRequest,
 ) -> Result<TranscriptionResult, TranscriptionError> {
-    validate_wav_path(&request.wav_path)?;
+    validate_audio_path(&request.wav_path)?;
     validate_model_dir(&request.model_dir)?;
 
-    let mut model = Nemotron::from_pretrained(&request.model_dir, None)
-        .map_err(|_| TranscriptionError::RecognizerInitializationFailed(request.model_dir.clone()))?;
+    let mut model = Nemotron::from_pretrained(&request.model_dir, None).map_err(|_| {
+        TranscriptionError::RecognizerInitializationFailed(request.model_dir.clone())
+    })?;
 
     configure_multilingual(&mut model, request.target_lang.as_deref())?;
 
-    let canonical_wav_path = std::fs::canonicalize(&request.wav_path)
+    let canonical_source_path = std::fs::canonicalize(&request.wav_path)
         .map_err(|_| TranscriptionError::MissingWavFile(request.wav_path.clone()))?;
+
+    // Always normalize through mono 16 kHz PCM (in-memory). For non-WAV sources
+    // this is required; for multi-rate/multi-channel WAV it is also required.
+    let decoded =
+        decode_audio_file(&canonical_source_path).map_err(|error| map_decode_error(error))?;
+    debug_assert_eq!(decoded.sample_rate, TARGET_SAMPLE_RATE);
 
     let start = Instant::now();
     let transcript_text = model
-        .transcribe_file(&canonical_wav_path)
+        .transcribe_audio(&decoded.samples)
         .map_err(|_| TranscriptionError::DecodeFailed(request.wav_path.clone()))?;
 
     Ok(TranscriptionResult {
-        wav_path: canonical_wav_path,
+        wav_path: canonical_source_path,
         transcript_text,
         backend_name: BACKEND_NAME.to_string(),
         model_name: request.model_name.clone(),
@@ -113,7 +130,8 @@ pub fn transcribe_wav(
 
 pub struct StreamingTranscriber {
     model: Nemotron,
-    /// Leftover samples from the previous `feed_chunk` call.
+    /// Leftover samples from the previous `feed_chunk` call that did not fill
+    /// a complete 560ms window.
     pending: Vec<f32>,
     /// Target language used for this transcriber (for logging / debugging)
     target_lang: Option<String>,
@@ -140,7 +158,9 @@ impl StreamingTranscriber {
         })
     }
 
-    /// Feed raw mono 16 kHz f32 samples. Returns the current partial transcript.
+    /// Feed raw mono 16 kHz f32 samples. Returns the current partial transcript
+    /// after processing any complete 560ms windows contained in `samples`
+    /// (combined with any leftover samples from previous calls).
     pub fn feed_chunk(&mut self, samples: &[f32]) -> Result<String, TranscriptionError> {
         self.pending.extend_from_slice(samples);
 
@@ -160,7 +180,8 @@ impl StreamingTranscriber {
         Ok(self.model.get_transcript())
     }
 
-    /// Flush any remaining samples (zero-padded) and return the final transcript.
+    /// Flush any remaining buffered samples (zero-padded to a full 560ms
+    /// window) and return the final accumulated transcript.
     pub fn flush(&mut self) -> Result<String, TranscriptionError> {
         if !self.pending.is_empty() {
             let mut padded = [0.0f32; STREAMING_CHUNK_SAMPLES];
@@ -199,17 +220,18 @@ fn configure_multilingual(
 ) -> Result<(), TranscriptionError> {
     if model.mode() == NemotronMode::Multilingual {
         let lang = target_lang.unwrap_or("fr-FR");
-        model.set_target_lang(lang)
+        model
+            .set_target_lang(lang)
             .map_err(|e| TranscriptionError::LanguageConfigFailed(format!("lang={}: {}", lang, e)))?;
     }
     Ok(())
 }
 
-fn validate_wav_path(wav_path: &Path) -> Result<(), TranscriptionError> {
-    if wav_path.is_file() {
+fn validate_audio_path(audio_path: &Path) -> Result<(), TranscriptionError> {
+    if audio_path.is_file() {
         Ok(())
     } else {
-        Err(TranscriptionError::MissingWavFile(wav_path.to_path_buf()))
+        Err(TranscriptionError::MissingWavFile(audio_path.to_path_buf()))
     }
 }
 
@@ -246,49 +268,46 @@ fn required_model_file(
     }
 }
 
-fn load_wav(wav_path: &Path) -> Result<(PathBuf, i32, Vec<f32>), TranscriptionError> {
-    let canonical_wav_path = std::fs::canonicalize(wav_path)
-        .map_err(|_| TranscriptionError::MissingWavFile(wav_path.to_path_buf()))?;
-
-    let mut reader = WavReader::open(&canonical_wav_path)
-        .map_err(|_| TranscriptionError::InvalidWaveFile(canonical_wav_path.clone()))?;
-
-    let spec = reader.spec();
-
-    if spec.channels != 1 {
-        return Err(TranscriptionError::InvalidWaveFile(canonical_wav_path));
+fn map_decode_error(error: DecodeError) -> TranscriptionError {
+    match error {
+        DecodeError::MissingFile(path) | DecodeError::OpenFailed(path) => {
+            TranscriptionError::MissingWavFile(path)
+        }
+        DecodeError::UnsupportedFormat(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "unsupported audio format".into(),
+        },
+        DecodeError::NoAudioTrack(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "no audio track found".into(),
+        },
+        DecodeError::MissingSampleRate(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "missing sample rate metadata".into(),
+        },
+        DecodeError::EmptyAudio(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "decoded audio is empty".into(),
+        },
+        DecodeError::DecodeFailed { path, detail } => {
+            TranscriptionError::AudioDecodeFailed { path, detail }
+        }
     }
-
-    let sample_rate = spec.sample_rate as i32;
-    let samples = read_wav_samples(&mut reader, spec.bits_per_sample, spec.sample_format)
-        .map_err(|_| TranscriptionError::InvalidWaveFile(canonical_wav_path.clone()))?;
-
-    Ok((canonical_wav_path, sample_rate, samples))
 }
 
-fn read_wav_samples<R>(
-    reader: &mut WavReader<R>,
-    bits_per_sample: u16,
-    sample_format: SampleFormat,
-) -> Result<Vec<f32>, hound::Error>
-where
-    R: std::io::Read,
-{
-    match sample_format {
-        SampleFormat::Float => reader.samples::<f32>().collect(),
-        SampleFormat::Int if bits_per_sample <= 16 => reader
-            .samples::<i16>()
-            .map(|sample| sample.map(|s| s as f32 / i16::MAX as f32))
-            .collect(),
-        SampleFormat::Int if bits_per_sample <= 32 => {
-            let scale = ((1_i64 << (bits_per_sample - 1)) - 1) as f32;
-            reader
-                .samples::<i32>()
-                .map(|sample| sample.map(|s| s as f32 / scale))
-                .collect()
-        }
-        _ => Err(hound::Error::FormatError("unsupported wave encoding")),
-    }
+/// Load any supported audio file as mono f32 at 16 kHz.
+///
+/// Kept for tests and internal callers; production transcription goes through
+/// [`transcribe_wav`].
+pub fn load_audio_for_asr(audio_path: &Path) -> Result<(PathBuf, i32, Vec<f32>), TranscriptionError> {
+    let canonical = std::fs::canonicalize(audio_path)
+        .map_err(|_| TranscriptionError::MissingWavFile(audio_path.to_path_buf()))?;
+    let decoded = decode_audio_file(&canonical).map_err(map_decode_error)?;
+    Ok((
+        canonical,
+        decoded.sample_rate as i32,
+        decoded.samples,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +371,7 @@ mod tests {
         ]));
         fs::copy(fixture_path(), &wav_path).unwrap();
 
-        let (normalized_path, sample_rate, samples) = load_wav(&wav_path).unwrap();
+        let (normalized_path, sample_rate, samples) = load_audio_for_asr(&wav_path).unwrap();
 
         assert_eq!(normalized_path, std::fs::canonicalize(&wav_path).unwrap());
         assert_eq!(sample_rate, 16_000);
