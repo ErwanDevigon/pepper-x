@@ -9,10 +9,10 @@ use crate::app_model::{RuntimeReadinessSummary, SettingsSurfaceState};
 use crate::history_view::build_history_browser;
 use crate::overlay::OverlayView;
 use crate::settings_view::SettingsView;
-use crate::transcript_log::TranscriptEntry;
 use pepperx_models::{ModelInventoryEntry, ModelKind};
 
 use crate::history_store::ArchivedRun;
+use crate::history_view::{RerunArchivedRunFn, RerunCleanupFn};
 use crate::settings::AppSettings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +56,8 @@ struct WindowContentSnapshot {
 pub struct MainWindow {
     app: adw::Application,
     content_providers: Rc<WindowContentProviders>,
-    rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
-    rerun_cleanup: Option<Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>>,
+    rerun_archived_run: Option<RerunArchivedRunFn>,
+    rerun_cleanup: Option<RerunCleanupFn>,
     play_audio: Option<Rc<dyn Fn(PathBuf)>>,
     live_status: Rc<RefCell<LiveStatus>>,
     state: Rc<RefCell<Option<WindowState>>>,
@@ -151,10 +151,8 @@ impl MainWindow {
         history_runs: H,
         settings_surface_state: S,
         diagnostics_summary: D,
-        rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
-        rerun_cleanup: Option<
-            Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>,
-        >,
+        rerun_archived_run: Option<RerunArchivedRunFn>,
+        rerun_cleanup: Option<RerunCleanupFn>,
         play_audio: Option<Rc<dyn Fn(PathBuf)>>,
     ) -> Self
     where
@@ -496,8 +494,8 @@ fn default_diagnostics_summary() -> String {
 fn replace_history_browser(
     container: &gtk::Box,
     runs: &[ArchivedRun],
-    rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
-    rerun_cleanup: Option<Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>>,
+    rerun_archived_run: Option<RerunArchivedRunFn>,
+    rerun_cleanup: Option<RerunCleanupFn>,
     play_audio: Option<Rc<dyn Fn(PathBuf)>>,
 ) {
     while let Some(child) = container.first_child() {

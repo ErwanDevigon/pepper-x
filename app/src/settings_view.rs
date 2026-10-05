@@ -12,12 +12,12 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::app_model::SettingsSurfaceState;
+use crate::history_view::{RerunArchivedRunFn, RerunCleanupFn};
 use crate::settings::{
     asr_model_is_multilingual, corrections_store_path, load_microphone_ui_state,
     resolve_asr_language, save_launch_at_login, save_preferred_microphone, AppSettings,
     MicrophoneUiState, ASR_LANGUAGE_OPTIONS,
 };
-use crate::transcript_log::TranscriptEntry;
 use pepperx_corrections::CorrectionStore;
 use pepperx_models::{supported_models, ModelKind};
 
@@ -143,10 +143,8 @@ impl SettingsView {
     pub fn new_with_extras(
         surface_state: SettingsSurfaceState,
         history_widget: Option<gtk::Widget>,
-        _rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
-        _rerun_cleanup: Option<
-            Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>,
-        >,
+        _rerun_archived_run: Option<RerunArchivedRunFn>,
+        _rerun_cleanup: Option<RerunCleanupFn>,
         _play_audio: Option<Rc<dyn Fn(std::path::PathBuf)>>,
         diagnostics_summary: String,
         shared_trigger_config: Option<SharedTriggerConfig>,
@@ -547,7 +545,7 @@ impl SettingsView {
             .xalign(0.0)
             .wrap(true)
             .css_classes(["caption"])
-            .label(&model_readiness_status_text())
+            .label(model_readiness_status_text())
             .build();
         models_page.append(&model_status_label);
 
@@ -1714,6 +1712,7 @@ fn prompt_profile_from_index(index: u32) -> String {
 }
 
 /// Wire up a shortcut recorder button with conflict detection against the other recorder.
+#[allow(clippy::too_many_arguments)] // GTK widget wiring
 fn install_shortcut_recorder(
     button: &gtk::Button,
     own_value: Rc<RefCell<String>>,

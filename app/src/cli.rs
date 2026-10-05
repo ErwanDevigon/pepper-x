@@ -267,12 +267,8 @@ pub fn run(startup_mode: StartupMode) -> Result<Option<TranscriptEntry>, CliRunE
             let model = catalog_model(&model_id)
                 .ok_or_else(|| CliRunError::UnknownModel(model_id.clone()))?;
             let cache_root = default_cache_root();
-            let readiness = bootstrap_model(model, &cache_root).map_err(|error| {
-                CliRunError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    error.to_string(),
-                ))
-            })?;
+            let readiness = bootstrap_model(model, &cache_root)
+                .map_err(|error| CliRunError::Io(std::io::Error::other(error.to_string())))?;
             println!(
                 "Bootstrapped {} model {} into {}",
                 model_kind_label(model.kind),

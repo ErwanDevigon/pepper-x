@@ -284,7 +284,7 @@ fn main() {
     };
 
     // P-cores only on Intel hybrid; clamp to [2, 4].
-    let n_threads = (num_cpus::get_physical() as i32).min(4).max(2);
+    let n_threads = (num_cpus::get_physical() as i32).clamp(2, 4);
 
     eprintln!(
         "[pepperx-cleanup-helper] daemon started (pid={})",
@@ -517,6 +517,7 @@ fn handle_prefill(
 // Generate
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn handle_generate(
     model: &'static LlamaModel,
     backend: &LlamaBackend,
@@ -598,11 +599,12 @@ fn handle_generate(
     let mut batch = LlamaBatch::new(1, 1);
     let mut first_iter = true;
 
+    // `n_cur` is the KV position of the next token; it starts at the prompt length,
+    // so a plain loop counter reads more clearly than zipping ranges.
+    #[allow(clippy::explicit_counter_loop)]
     for _ in 0..max_tokens {
-        if !first_iter {
-            if ctx.decode(&mut batch).is_err() {
-                break;
-            }
+        if !first_iter && ctx.decode(&mut batch).is_err() {
+            break;
         }
         first_iter = false;
 

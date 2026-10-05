@@ -369,6 +369,7 @@ fn present_primary_surface(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // GTK widget wiring
 fn install_command_pump(
     app: adw::Application,
     window: MainWindow,

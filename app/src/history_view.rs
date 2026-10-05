@@ -20,6 +20,12 @@ pub(crate) enum HistoryListMode {
     AudioFiles,
 }
 
+/// Callback that reruns an archived run (run id, ASR model id).
+pub(crate) type RerunArchivedRunFn = Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>;
+/// Callback that reruns cleanup for an archived run (run id, cleanup model id, custom prompt).
+pub(crate) type RerunCleanupFn =
+    Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HistoryBrowserModel {
     /// Full unfiltered archive.
@@ -223,8 +229,8 @@ fn is_audio_file_lineage(run: &ArchivedRun, all_runs: &[ArchivedRun]) -> bool {
 
 pub(crate) fn build_history_browser(
     runs: &[ArchivedRun],
-    rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
-    rerun_cleanup: Option<Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>>,
+    rerun_archived_run: Option<RerunArchivedRunFn>,
+    rerun_cleanup: Option<RerunCleanupFn>,
     play_audio: Option<Rc<dyn Fn(PathBuf)>>,
 ) -> gtk::Box {
     let model = Rc::new(RefCell::new(HistoryBrowserModel::new(runs.to_vec())));
@@ -1206,6 +1212,7 @@ fn display_file_name(path: &Path) -> String {
 // Populate detail widgets for a selected run
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // GTK widget wiring
 fn populate_detail_for_run(
     run: &ArchivedRun,
     metadata_line: &gtk::Label,
@@ -1658,7 +1665,7 @@ fn format_epoch_ms(epoch_ms: u64) -> String {
     const DAYS_IN_MONTH: &[u64] = &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
     fn is_leap_year(year: u64) -> bool {
-        (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
     }
 
     fn days_in_year(year: u64) -> u64 {
@@ -2411,7 +2418,7 @@ mod history_view_tests {
     #[test]
     fn format_epoch_ms_renders_readable_date() {
         // 2026-01-01 00:00:00 UTC = 1767225600 seconds
-        let formatted = format_epoch_ms(1767225600_000);
+        let formatted = format_epoch_ms(1_767_225_600_000);
         assert!(formatted.contains("Jan"));
         assert!(formatted.contains("2026"));
     }

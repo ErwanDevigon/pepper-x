@@ -524,6 +524,9 @@ impl CallbackState {
     }
 }
 
+// FriendlyInsertFailure sits right at clippy's 128-byte threshold; it is built at
+// most once per insertion attempt, so boxing it here would only add churn.
+#[allow(clippy::result_large_err)]
 pub fn select_friendly_insert_backend(
     target: &FriendlyFocusedTarget,
     policy: &FriendlyInsertPolicy,
@@ -727,9 +730,7 @@ fn run_clipboard_paste_with_adapter<A: ClipboardPasteAdapter>(
     let paste_result = adapter.paste();
     let restore_result = adapter.restore(snapshot);
 
-    if let Err(error) = restore_result {
-        return Err(error);
-    }
+    restore_result?;
 
     paste_result?;
 

@@ -154,7 +154,7 @@ impl std::error::Error for DeviceEnumerationError {}
 pub fn enumerate_microphones() -> Result<MicrophoneInventory, DeviceEnumerationError> {
     #[cfg(target_os = "linux")]
     {
-        return enumerate_linux_microphones();
+        enumerate_linux_microphones()
     }
 
     #[cfg(not(target_os = "linux"))]

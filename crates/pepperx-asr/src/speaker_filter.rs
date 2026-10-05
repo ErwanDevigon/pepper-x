@@ -389,7 +389,7 @@ fn filter_segments_by_energy(
             let ratio = mean_energy / target_energy;
 
             // Accept if the segment energy is within tolerance of the target.
-            ratio >= (1.0 / SPEAKER_ENERGY_TOLERANCE) && ratio <= SPEAKER_ENERGY_TOLERANCE
+            ((1.0 / SPEAKER_ENERGY_TOLERANCE)..=SPEAKER_ENERGY_TOLERANCE).contains(&ratio)
         })
         .copied()
         .collect()

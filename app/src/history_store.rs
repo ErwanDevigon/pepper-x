@@ -467,11 +467,7 @@ fn archive_source_wav(source_wav_path: &Path, run_dir: &Path) -> Option<io::Resu
     }
 
     let archived_source_wav_path = run_dir.join(ARCHIVED_SOURCE_WAV_FILE_NAME);
-    Some(
-        fs::copy(source_wav_path, &archived_source_wav_path)
-            .map(|_| archived_source_wav_path)
-            .map_err(io::Error::from),
-    )
+    Some(fs::copy(source_wav_path, &archived_source_wav_path).map(|_| archived_source_wav_path))
 }
 
 fn is_pepperx_recording_filename(name: &str) -> bool {

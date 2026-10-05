@@ -709,8 +709,8 @@ fn run_capture_loop(
             }
         }
 
-        for i in 0..nfds as usize {
-            let file_idx = events[i].u64 as usize;
+        for event in events.iter().take(nfds as usize) {
+            let file_idx = event.u64 as usize;
             let file = &files[file_idx];
 
             let n = match (&*file).read(&mut buf) {

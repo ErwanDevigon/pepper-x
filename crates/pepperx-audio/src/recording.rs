@@ -258,9 +258,9 @@ impl ActiveRecording {
                 .take()
                 .expect("recording worker should be present");
 
-            return worker.join().map_err(|_| {
+            worker.join().map_err(|_| {
                 RecordingError::new("Pepper X recording worker panicked while stopping")
-            })?;
+            })?
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -283,7 +283,7 @@ pub fn start_recording_with_chunk_sink(
 ) -> Result<ActiveRecording, RecordingError> {
     #[cfg(target_os = "linux")]
     {
-        return start_linux_recording(request, chunk_sink);
+        start_linux_recording(request, chunk_sink)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -298,7 +298,7 @@ pub fn probe_signal_level(
 ) -> Result<SignalLevelSample, SignalLevelError> {
     #[cfg(target_os = "linux")]
     {
-        return probe_linux_signal_level(selected_microphone);
+        probe_linux_signal_level(selected_microphone)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -736,7 +736,7 @@ fn configure_capture_stream(
                         captured_audio.channel_count = format.channels() as u16;
                     }
 
-                    for sample_bytes in payload.chunks_exact(std::mem::size_of::<i16>()) {
+                    for sample_bytes in payload.as_chunks::<{ std::mem::size_of::<i16>() }>().0 {
                         let sample = i16::from_le_bytes([sample_bytes[0], sample_bytes[1]]) as f32
                             / i16::MAX as f32;
                         captured_audio.interleaved_samples.push(sample);

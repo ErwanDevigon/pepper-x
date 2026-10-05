@@ -363,10 +363,7 @@ impl LiveRuntimeHandle {
             .lock()
             .expect("context prefetch lock poisoned")
             .take()?;
-        match receiver.recv() {
-            Ok(context) => Some(context),
-            Err(_) => None,
-        }
+        receiver.recv().ok()
     }
 
     pub fn record_and_transcribe<F>(
@@ -654,7 +651,7 @@ where
 }
 
 #[cfg(test)]
-mod session_runtime {
+mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::path::Path;

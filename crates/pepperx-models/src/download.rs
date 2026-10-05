@@ -477,7 +477,7 @@ fn download_to_path(url: &str, target_path: &Path) -> Result<(), io::Error> {
 
     let response = ureq::get(url)
         .call()
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        .map_err(|error| io::Error::other(error.to_string()))?;
     let mut reader = response.into_reader();
     let mut file = File::create(target_path)?;
     io::copy(&mut reader, &mut file)?;
