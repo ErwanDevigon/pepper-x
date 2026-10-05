@@ -54,7 +54,11 @@ impl std::fmt::Display for SpeakerFilterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidWavFile(path) => {
-                write!(f, "invalid WAV file for speaker filtering: {}", path.display())
+                write!(
+                    f,
+                    "invalid WAV file for speaker filtering: {}",
+                    path.display()
+                )
             }
             Self::IoError(msg) => write!(f, "speaker filter I/O error: {msg}"),
         }
@@ -200,8 +204,8 @@ impl SpeechSegment {
 }
 
 fn load_mono_wav(path: &Path) -> Result<(u32, Vec<f32>), SpeakerFilterError> {
-    let mut reader =
-        WavReader::open(path).map_err(|_| SpeakerFilterError::InvalidWavFile(path.to_path_buf()))?;
+    let mut reader = WavReader::open(path)
+        .map_err(|_| SpeakerFilterError::InvalidWavFile(path.to_path_buf()))?;
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
 
@@ -285,10 +289,7 @@ fn compute_frame_energies(samples: &[f32]) -> Vec<f32> {
 }
 
 fn build_speech_mask(frame_energies: &[f32]) -> Vec<bool> {
-    let peak_energy = frame_energies
-        .iter()
-        .copied()
-        .fold(0.0_f32, f32::max);
+    let peak_energy = frame_energies.iter().copied().fold(0.0_f32, f32::max);
 
     if peak_energy < f32::EPSILON {
         return vec![false; frame_energies.len()];
@@ -341,10 +342,7 @@ fn merge_speech_segments(speech_mask: &[bool]) -> Vec<SpeechSegment> {
     segments
 }
 
-fn target_speaker_energy(
-    frame_energies: &[f32],
-    segments: &[SpeechSegment],
-) -> f32 {
+fn target_speaker_energy(frame_energies: &[f32], segments: &[SpeechSegment]) -> f32 {
     let mut profile_frames = Vec::new();
     for segment in segments {
         for frame_idx in segment.start_frame..segment.end_frame {
@@ -387,8 +385,7 @@ fn filter_segments_by_energy(
                 return false;
             }
 
-            let mean_energy =
-                segment_energies.iter().sum::<f32>() / segment_energies.len() as f32;
+            let mean_energy = segment_energies.iter().sum::<f32>() / segment_energies.len() as f32;
             let ratio = mean_energy / target_energy;
 
             // Accept if the segment energy is within tolerance of the target.
@@ -438,8 +435,7 @@ mod tests {
         (0..num_samples)
             .map(|i| {
                 amplitude
-                    * (2.0 * std::f32::consts::PI * frequency * i as f32 / sample_rate as f32)
-                        .sin()
+                    * (2.0 * std::f32::consts::PI * frequency * i as f32 / sample_rate as f32).sin()
             })
             .collect()
     }
@@ -455,8 +451,7 @@ mod tests {
         write_test_wav(&input, 16_000, &sine_wave(440.0, 16_000, 0.5, 0.5));
 
         let output = unique_wav_path("short-output");
-        let result =
-            filter_other_speakers(&input, &output).expect("filter should succeed");
+        let result = filter_other_speakers(&input, &output).expect("filter should succeed");
 
         assert!(!result.filtering_applied);
         assert!(result.fell_back_to_full);
@@ -473,8 +468,7 @@ mod tests {
         write_test_wav(&input, 16_000, &sine_wave(440.0, 16_000, 2.0, 0.5));
 
         let output = unique_wav_path("single-speaker-output");
-        let result =
-            filter_other_speakers(&input, &output).expect("filter should succeed");
+        let result = filter_other_speakers(&input, &output).expect("filter should succeed");
 
         // All segments match the target speaker, so no filtering is needed.
         assert!(!result.filtering_applied);
@@ -504,8 +498,7 @@ mod tests {
         write_test_wav(&input, 16_000, &samples);
 
         let output = unique_wav_path("two-speaker-output");
-        let result =
-            filter_other_speakers(&input, &output).expect("filter should succeed");
+        let result = filter_other_speakers(&input, &output).expect("filter should succeed");
 
         assert!(result.filtering_applied);
         assert!(!result.fell_back_to_full);
@@ -523,8 +516,7 @@ mod tests {
         write_test_wav(&input, 16_000, &silence(16_000, 2.0));
 
         let output = unique_wav_path("silence-output");
-        let result =
-            filter_other_speakers(&input, &output).expect("filter should succeed");
+        let result = filter_other_speakers(&input, &output).expect("filter should succeed");
 
         assert!(!result.filtering_applied);
         assert!(result.fell_back_to_full);

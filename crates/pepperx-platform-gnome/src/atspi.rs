@@ -115,7 +115,6 @@ impl FriendlyInsertPolicy {
             expectation: FriendlyInsertExpectation::LiveSupported,
         }
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

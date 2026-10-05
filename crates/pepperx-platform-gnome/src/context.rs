@@ -6,10 +6,7 @@ use crate::atspi::{
     inspect_focused_target, FocusedTargetSnapshot, FriendlyInsertRunError, ProbeStatus,
     RecoveryAction, RecoveryProbe,
 };
-use crate::screenshot::{
-    validate_interface_xml, ScreenshotContractError,
-    ScreenshotWindowError,
-};
+use crate::screenshot::{validate_interface_xml, ScreenshotContractError, ScreenshotWindowError};
 
 const SUPPORTING_CONTEXT_LIMIT: usize = 512;
 

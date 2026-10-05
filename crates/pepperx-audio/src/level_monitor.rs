@@ -335,9 +335,7 @@ fn resolve_selected_node_id(
     let deadline = Instant::now() + Duration::from_secs(5);
     while !done.get() && enumeration_error.borrow().is_none() {
         if Instant::now() >= deadline {
-            return Err(RecordingError::new(
-                "PipeWire node resolution timed out",
-            ));
+            return Err(RecordingError::new("PipeWire node resolution timed out"));
         }
         mainloop.loop_().iterate(Duration::from_millis(100));
     }

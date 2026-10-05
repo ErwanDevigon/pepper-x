@@ -6,9 +6,9 @@ use pepperx_audio::recording::{
 };
 use pepperx_audio::SelectedMicrophone;
 use pepperx_ipc::{LiveStatus, SharedLiveStatus};
+use pepperx_platform_gnome::context::SupportingContext;
 use pepperx_platform_gnome::service::{RecordingRuntime, RecordingRuntimeError};
 use pepperx_session::{RecordingSession, SessionError, SessionState, TriggerSource};
-use pepperx_platform_gnome::context::SupportingContext;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -155,8 +155,7 @@ impl Recorder for PipeWireRecorder {
             "PipeWireRecorder should only start one active recording at a time"
         );
 
-        self.active_recording =
-            Some(start_recording_with_chunk_sink(request, Some(chunk_sink))?);
+        self.active_recording = Some(start_recording_with_chunk_sink(request, Some(chunk_sink))?);
         Ok(())
     }
 
@@ -211,7 +210,6 @@ impl LiveRuntimeHandle {
         self.play_sounds.store(enabled, Ordering::Relaxed);
     }
 
-
     pub fn start_recording(
         &self,
         trigger_source: TriggerSource,
@@ -225,11 +223,7 @@ impl LiveRuntimeHandle {
             .runtime
             .lock()
             .expect("live runtime lock poisoned")
-            .start_recording_streaming(
-                trigger_source,
-                self.selected_microphone.clone(),
-                chunk_sink,
-            )
+            .start_recording_streaming(trigger_source, self.selected_microphone.clone(), chunk_sink)
             .map(|_| ());
 
         match &result {
@@ -309,9 +303,7 @@ impl LiveRuntimeHandle {
                 let _ = sender.send(context);
             })
         {
-            eprintln!(
-                "[Pepper X] failed to spawn context prefetch thread: {error}"
-            );
+            eprintln!("[Pepper X] failed to spawn context prefetch thread: {error}");
             *self
                 .context_prefetch
                 .lock()

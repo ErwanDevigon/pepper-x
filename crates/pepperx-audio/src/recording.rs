@@ -328,7 +328,12 @@ fn start_linux_recording(
     let worker_request = request.clone();
     let worker_chunk_sink = chunk_sink.clone();
     let worker = thread::spawn(move || {
-        capture_recording(worker_request, control_receiver, setup_sender, worker_chunk_sink)
+        capture_recording(
+            worker_request,
+            control_receiver,
+            setup_sender,
+            worker_chunk_sink,
+        )
     });
 
     match setup_receiver
@@ -686,9 +691,8 @@ fn configure_capture_stream(
             // State for streaming chunk dispatch — only allocated when a sink
             // is provided.
             let chunk_sink = Rc::new(RefCell::new(chunk_sink));
-            let streaming_pending: Rc<RefCell<Vec<f32>>> = Rc::new(RefCell::new(
-                Vec::with_capacity(STREAMING_CHUNK_SAMPLES),
-            ));
+            let streaming_pending: Rc<RefCell<Vec<f32>>> =
+                Rc::new(RefCell::new(Vec::with_capacity(STREAMING_CHUNK_SAMPLES)));
             move |stream, format| match stream.dequeue_buffer() {
                 None => {}
                 Some(mut buffer) => {

@@ -374,7 +374,11 @@ where
     F: FnOnce() -> std::io::Result<()>,
 {
     let settings = crate::settings::AppSettings::load_or_default();
-    let runtime = LiveRuntimeHandle::new(selected_microphone, SharedLiveStatus::new(), settings.play_sounds);
+    let runtime = LiveRuntimeHandle::new(
+        selected_microphone,
+        SharedLiveStatus::new(),
+        settings.play_sounds,
+    );
     runtime
         .record_and_transcribe(TriggerSource::ShellAction, wait_for_stop)
         .map_err(|error| TranscriptionRunError::LiveRecording(error.to_string()))

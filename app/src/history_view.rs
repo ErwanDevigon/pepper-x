@@ -84,9 +84,7 @@ impl HistoryBrowserModel {
     pub(crate) fn selected_details_text(&self) -> Option<String> {
         let selected_run = self.selected_run()?;
         match self.comparison_runs_for_selected() {
-            Some((original_run, rerun)) => {
-                Some(details_text_comparison(original_run, rerun))
-            }
+            Some((original_run, rerun)) => Some(details_text_comparison(original_run, rerun)),
             None => Some(details_text_single(selected_run)),
         }
     }
@@ -126,8 +124,7 @@ impl HistoryBrowserModel {
     }
 
     pub(crate) fn selected_asr_model(&self) -> Option<&str> {
-        self.selected_run()
-            .map(|run| run.entry.model_name.as_str())
+        self.selected_run().map(|run| run.entry.model_name.as_str())
     }
 
     pub(crate) fn selected_cleanup_model(&self) -> Option<&str> {
@@ -318,12 +315,8 @@ pub(crate) fn build_history_browser(
         .filter(|m| m.kind == ModelKind::Asr)
         .map(|m| m.id.to_string())
         .collect();
-    let asr_string_list = gtk::StringList::new(
-        &asr_model_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-    );
+    let asr_string_list =
+        gtk::StringList::new(&asr_model_ids.iter().map(String::as_str).collect::<Vec<_>>());
     let asr_dropdown = gtk::DropDown::new(Some(asr_string_list), None::<gtk::Expression>);
     let initial_asr = model
         .borrow()
@@ -376,7 +369,9 @@ pub(crate) fn build_history_browser(
         .accepts_tab(false)
         .height_request(150)
         .build();
-    let initial_prompt = settings.effective_cleanup_custom_prompt().unwrap_or_default();
+    let initial_prompt = settings
+        .effective_cleanup_custom_prompt()
+        .unwrap_or_default();
     prompt_text_view.buffer().set_text(&initial_prompt);
 
     let prompt_frame = gtk::Frame::new(None);
@@ -389,9 +384,13 @@ pub(crate) fn build_history_browser(
     // "Use captured OCR" checkbox (shown only when entry has OCR data)
     let use_ocr_check = gtk::CheckButton::with_label("Use captured OCR");
     use_ocr_check.set_active(false);
-    use_ocr_check.set_visible(model.borrow().selected_run()
-        .and_then(|r| r.ocr_text.as_ref())
-        .is_some());
+    use_ocr_check.set_visible(
+        model
+            .borrow()
+            .selected_run()
+            .and_then(|r| r.ocr_text.as_ref())
+            .is_some(),
+    );
 
     // Cleanup model picker + buttons row
     let cleanup_model_ids: Vec<String> = supported_models()
@@ -514,11 +513,7 @@ pub(crate) fn build_history_browser(
                 if let Some(entry) = rerun_archived_run(run_id, asr_model_id) {
                     rerun_raw_card_label.set_label(&entry.transcript_text);
                     rerun_raw_card_frame.set_visible(true);
-                    if let Some(cleaned) = entry
-                        .cleanup
-                        .as_ref()
-                        .and_then(|c| c.cleaned_text())
-                    {
+                    if let Some(cleaned) = entry.cleanup.as_ref().and_then(|c| c.cleaned_text()) {
                         let original_text = original_cleaned_label.label();
                         let diff_markup = word_diff_markup(&original_text, cleaned);
                         rerun_cleaned_card_label.set_markup(&diff_markup);
@@ -535,8 +530,7 @@ pub(crate) fn build_history_browser(
     // The click handler runs the cleanup rerun itself on a worker thread; the
     // callback only signals that cleanup reruns are enabled for this view.
     if rerun_cleanup.is_some() {
-        rerun_cleanup_button
-            .set_sensitive(model.borrow().cleanup_rerunnable_run_id().is_some());
+        rerun_cleanup_button.set_sensitive(model.borrow().cleanup_rerunnable_run_id().is_some());
         {
             let model = model.clone();
             let cleanup_dropdown = cleanup_dropdown.clone();
@@ -593,8 +587,9 @@ pub(crate) fn build_history_browser(
                         let _ = tx.send(result);
                     })
                     .expect("failed to spawn cleanup rerun thread");
-                gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                    match rx.try_recv() {
+                gtk::glib::timeout_add_local(
+                    std::time::Duration::from_millis(100),
+                    move || match rx.try_recv() {
                         Ok(result) => {
                             button.set_sensitive(true);
                             button.set_label("Run cleanup");
@@ -602,14 +597,12 @@ pub(crate) fn build_history_browser(
                                 if let Some(cleanup) = entry.cleanup.as_ref() {
                                     if let Some(cleaned) = cleanup.cleaned_text() {
                                         let original_text = original_cleaned_label.label();
-                                        let diff_markup =
-                                            word_diff_markup(&original_text, cleaned);
+                                        let diff_markup = word_diff_markup(&original_text, cleaned);
                                         rerun_cleaned_card_label.set_markup(&diff_markup);
                                         rerun_cleaned_card_frame.set_visible(true);
                                     }
                                     let elapsed_secs = cleanup.elapsed_ms as f64 / 1000.0;
-                                    cleanup_timing_label
-                                        .set_label(&format!("{elapsed_secs:.1}s"));
+                                    cleanup_timing_label.set_label(&format!("{elapsed_secs:.1}s"));
                                     cleanup_timing_label.set_visible(true);
                                 }
                             }
@@ -623,8 +616,8 @@ pub(crate) fn build_history_browser(
                             button.set_label("Run cleanup");
                             gtk::glib::ControlFlow::Break
                         }
-                    }
-                });
+                    },
+                );
             });
         }
     } else {
@@ -1647,9 +1640,7 @@ fn word_diff_markup(old_text: &str, new_text: &str) -> String {
             }
             DiffOp::Added(word) => {
                 let escaped = glib::markup_escape_text(word);
-                parts.push(format!(
-                    "<span foreground=\"#2ec27e\">{escaped}</span>"
-                ));
+                parts.push(format!("<span foreground=\"#2ec27e\">{escaped}</span>"));
             }
         }
     }
@@ -1671,7 +1662,11 @@ fn format_epoch_ms(epoch_ms: u64) -> String {
     }
 
     fn days_in_year(year: u64) -> u64 {
-        if is_leap_year(year) { 366 } else { 365 }
+        if is_leap_year(year) {
+            366
+        } else {
+            365
+        }
     }
 
     fn days_in_month(year: u64, month: usize) -> u64 {
@@ -1856,10 +1851,7 @@ pub(crate) fn build_diarization_timeline(
         } else {
             speaker.to_string()
         };
-        let label = gtk::Label::builder()
-            .label(&label_text)
-            .xalign(0.0)
-            .build();
+        let label = gtk::Label::builder().label(&label_text).xalign(0.0).build();
 
         let legend_item = gtk::Box::new(Orientation::Horizontal, 4);
         legend_item.append(&swatch);
@@ -1911,7 +1903,10 @@ fn history_row_title(run: &ArchivedRun) -> String {
 }
 
 fn history_row_subtitle(run: &ArchivedRun) -> String {
-    format!("{} \u{2022} {} ms", run.entry.model_name, run.entry.elapsed_ms)
+    format!(
+        "{} \u{2022} {} ms",
+        run.entry.model_name, run.entry.elapsed_ms
+    )
 }
 
 fn picker_label(text: &str) -> gtk::Label {
@@ -2147,9 +2142,9 @@ mod history_view_tests {
 
         assert!(details.contains("Original raw transcript:\nhello from pepper x"));
         assert!(details.contains("Rerun raw transcript:\nhello from pepper ex"));
-        assert!(details.contains(
-            "Cleanup model: qwen3.5-2b-q4_k_m.gguf -> qwen3.5-0.8b-q4_k_m.gguf"
-        ));
+        assert!(
+            details.contains("Cleanup model: qwen3.5-2b-q4_k_m.gguf -> qwen3.5-0.8b-q4_k_m.gguf")
+        );
         assert!(details.contains("Cleanup prompt profile: ordinary-dictation -> literal-dictation"));
     }
 

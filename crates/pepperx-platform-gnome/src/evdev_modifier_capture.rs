@@ -273,25 +273,25 @@ pub fn evdev_keycode_name(keycode: u16) -> &'static str {
 /// events into evdev keycodes for storage.
 pub fn gdk_keyval_to_evdev(keyval: u32) -> Option<u16> {
     match keyval {
-        0xffe3 => Some(KEY_LEFTCTRL),          // GDK_KEY_Control_L
-        0xffe4 => Some(KEY_RIGHTCTRL),         // GDK_KEY_Control_R
-        0xffe1 => Some(KEY_LEFTSHIFT),         // GDK_KEY_Shift_L
-        0xffe2 => Some(KEY_RIGHTSHIFT),        // GDK_KEY_Shift_R
-        0xffe9 => Some(KEY_LEFTALT),           // GDK_KEY_Alt_L
-        0xffea => Some(KEY_RIGHTALT),          // GDK_KEY_Alt_R
-        0xffeb => Some(KEY_LEFTMETA),          // GDK_KEY_Super_L
-        0xffec => Some(KEY_RIGHTMETA),         // GDK_KEY_Super_R
-        0x20 => Some(KEY_SPACE),               // GDK_KEY_space
-        0xff0d => Some(KEY_ENTER),             // GDK_KEY_Return
-        0xff09 => Some(KEY_TAB),               // GDK_KEY_Tab
-        0xff08 => Some(KEY_BACKSPACE),         // GDK_KEY_BackSpace
-        0xffff => Some(KEY_DELETE),            // GDK_KEY_Delete
-        0xffe5 => Some(KEY_CAPSLOCK),          // GDK_KEY_Caps_Lock
-        0xff2d => Some(KEY_KATAKANAHIRAGANA),  // GDK_KEY_Kana_Lock
-        0xff26 => Some(KEY_KATAKANAHIRAGANA),  // GDK_KEY_Katakana
-        0xff25 => Some(KEY_KATAKANAHIRAGANA),  // GDK_KEY_Hiragana
-        0xff23 => Some(KEY_HENKAN),            // GDK_KEY_Henkan_Mode
-        0xff22 => Some(KEY_MUHENKAN),          // GDK_KEY_Muhenkan
+        0xffe3 => Some(KEY_LEFTCTRL),         // GDK_KEY_Control_L
+        0xffe4 => Some(KEY_RIGHTCTRL),        // GDK_KEY_Control_R
+        0xffe1 => Some(KEY_LEFTSHIFT),        // GDK_KEY_Shift_L
+        0xffe2 => Some(KEY_RIGHTSHIFT),       // GDK_KEY_Shift_R
+        0xffe9 => Some(KEY_LEFTALT),          // GDK_KEY_Alt_L
+        0xffea => Some(KEY_RIGHTALT),         // GDK_KEY_Alt_R
+        0xffeb => Some(KEY_LEFTMETA),         // GDK_KEY_Super_L
+        0xffec => Some(KEY_RIGHTMETA),        // GDK_KEY_Super_R
+        0x20 => Some(KEY_SPACE),              // GDK_KEY_space
+        0xff0d => Some(KEY_ENTER),            // GDK_KEY_Return
+        0xff09 => Some(KEY_TAB),              // GDK_KEY_Tab
+        0xff08 => Some(KEY_BACKSPACE),        // GDK_KEY_BackSpace
+        0xffff => Some(KEY_DELETE),           // GDK_KEY_Delete
+        0xffe5 => Some(KEY_CAPSLOCK),         // GDK_KEY_Caps_Lock
+        0xff2d => Some(KEY_KATAKANAHIRAGANA), // GDK_KEY_Kana_Lock
+        0xff26 => Some(KEY_KATAKANAHIRAGANA), // GDK_KEY_Katakana
+        0xff25 => Some(KEY_KATAKANAHIRAGANA), // GDK_KEY_Hiragana
+        0xff23 => Some(KEY_HENKAN),           // GDK_KEY_Henkan_Mode
+        0xff22 => Some(KEY_MUHENKAN),         // GDK_KEY_Muhenkan
         _ => None,
     }
 }
@@ -666,8 +666,14 @@ fn run_capture_loop(
         ));
     }
 
-    let hold_state = Mutex::new(ModifierHoldState::new(hold_config.clone(), TriggerMode::Hold));
-    let toggle_state = Mutex::new(ModifierHoldState::new(toggle_config.clone(), TriggerMode::Toggle));
+    let hold_state = Mutex::new(ModifierHoldState::new(
+        hold_config.clone(),
+        TriggerMode::Hold,
+    ));
+    let toggle_state = Mutex::new(ModifierHoldState::new(
+        toggle_config.clone(),
+        TriggerMode::Toggle,
+    ));
     let mut current_hold_config = hold_config;
     let mut current_toggle_config = toggle_config;
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
@@ -692,9 +698,13 @@ fn run_capture_loop(
             if *new_hold != current_hold_config || *new_toggle != current_toggle_config {
                 current_hold_config = new_hold.clone();
                 current_toggle_config = new_toggle.clone();
-                *hold_state.lock().expect("modifier hold state lock poisoned") =
+                *hold_state
+                    .lock()
+                    .expect("modifier hold state lock poisoned") =
                     ModifierHoldState::new(current_hold_config.clone(), TriggerMode::Hold);
-                *toggle_state.lock().expect("modifier toggle state lock poisoned") =
+                *toggle_state
+                    .lock()
+                    .expect("modifier toggle state lock poisoned") =
                     ModifierHoldState::new(current_toggle_config.clone(), TriggerMode::Toggle);
             }
         }
@@ -878,10 +888,7 @@ mod tests {
     fn ctrl_hold_chord_cancels() {
         let mut state = ctrl_hold();
         state.handle_key_event(true, KEY_LEFTCTRL);
-        assert_eq!(
-            state.handle_key_event(true, 46),
-            Some(HoldSignal::Stop)
-        );
+        assert_eq!(state.handle_key_event(true, 46), Some(HoldSignal::Stop));
         assert_eq!(state.handle_key_event(false, KEY_LEFTCTRL), None);
     }
 

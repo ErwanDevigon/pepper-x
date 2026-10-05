@@ -57,15 +57,27 @@ struct HelperResponse {
 
 impl HelperResponse {
     fn ok() -> Self {
-        Self { ok: true, text: None, error: None }
+        Self {
+            ok: true,
+            text: None,
+            error: None,
+        }
     }
 
     fn ok_text(text: String) -> Self {
-        Self { ok: true, text: Some(text), error: None }
+        Self {
+            ok: true,
+            text: Some(text),
+            error: None,
+        }
     }
 
     fn err(msg: String) -> Self {
-        Self { ok: false, text: None, error: Some(msg) }
+        Self {
+            ok: false,
+            text: None,
+            error: Some(msg),
+        }
     }
 }
 
@@ -297,9 +309,7 @@ fn main() {
         let request: HelperRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                write_response(&HelperResponse::err(format!(
-                    "invalid request JSON: {e}"
-                )));
+                write_response(&HelperResponse::err(format!("invalid request JSON: {e}")));
                 continue;
             }
         };
@@ -574,10 +584,8 @@ fn handle_generate(
     let decode_ms = t0.elapsed().as_millis();
 
     // --- Autoregressive generation ---
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::temp(temperature),
-        LlamaSampler::dist(1),
-    ]);
+    let mut sampler =
+        LlamaSampler::chain_simple([LlamaSampler::temp(temperature), LlamaSampler::dist(1)]);
 
     let deadline = Instant::now() + INFERENCE_TIMEOUT;
     let mut generated = String::new();

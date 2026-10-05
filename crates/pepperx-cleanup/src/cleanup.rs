@@ -391,8 +391,7 @@ pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupErr
     let request_json = serde_json::to_string(&helper_request).map_err(|error| {
         CleanupError::SubprocessError {
             message: format!("failed to serialize helper request: {error}"),
-        }
-    })?;
+        })?;
 
     eprintln!(
         "[Pepper X] cleanup generate: use_gpu={} gpu_layers={} raw_chars={} prompt_chars={} json_bytes={}",
@@ -471,10 +470,7 @@ fn send_to_helper(request_json: &str) -> Result<CleanupHelperResponse, CleanupEr
     })
 }
 
-fn spawn_cleanup_helper(
-    request_json: &str,
-    model_name: &str,
-) -> Result<String, CleanupError> {
+fn spawn_cleanup_helper(request_json: &str, model_name: &str) -> Result<String, CleanupError> {
     let response = send_to_helper(request_json)?;
 
     if !response.ok {
@@ -496,11 +492,9 @@ fn spawn_cleanup_helper(
         });
     }
 
-    response
-        .text
-        .ok_or_else(|| CleanupError::EmptyCompletion {
-            model_name: model_name.into(),
-        })
+    response.text.ok_or_else(|| CleanupError::EmptyCompletion {
+        model_name: model_name.into(),
+    })
 }
 
 /// Long-lived helper subprocess with persistent stdin/stdout handles.
@@ -667,7 +661,10 @@ pub(crate) fn strip_reasoning_tags(output: &str) -> String {
             // first newline after the tag (the model's internal reasoning).
             if result[..open_start].trim().is_empty() {
                 let after_tag = &result[open_end..];
-                let skip = after_tag.find('\n').map(|p| p + 1).unwrap_or(after_tag.len());
+                let skip = after_tag
+                    .find('\n')
+                    .map(|p| p + 1)
+                    .unwrap_or(after_tag.len());
                 result = after_tag[skip..].to_string();
             }
             break;

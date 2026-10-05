@@ -165,8 +165,7 @@ impl StreamingTranscriber {
         self.pending.extend_from_slice(samples);
 
         while self.pending.len() >= STREAMING_CHUNK_SAMPLES {
-            let chunk: [f32; STREAMING_CHUNK_SAMPLES] = self.pending
-                [..STREAMING_CHUNK_SAMPLES]
+            let chunk: [f32; STREAMING_CHUNK_SAMPLES] = self.pending[..STREAMING_CHUNK_SAMPLES]
                 .try_into()
                 .expect("slice length verified");
 

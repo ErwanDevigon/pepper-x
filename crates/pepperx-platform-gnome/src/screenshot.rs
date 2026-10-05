@@ -105,10 +105,14 @@ pub fn screenshot_window(
     // no user dialog (when permission is already granted).
     let output = std::process::Command::new("gdbus")
         .args([
-            "call", "--session",
-            "--dest", "org.freedesktop.portal.Desktop",
-            "--object-path", "/org/freedesktop/portal/desktop",
-            "--method", "org.freedesktop.portal.Screenshot.Screenshot",
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.portal.Desktop",
+            "--object-path",
+            "/org/freedesktop/portal/desktop",
+            "--method",
+            "org.freedesktop.portal.Screenshot.Screenshot",
             "", // parent_window
             "{'interactive': <false>}",
         ])
@@ -135,10 +139,11 @@ pub fn screenshot_window(
         .map_err(|_| ScreenshotWindowError::Unavailable)?
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("Screenshot")
-                && e.path().extension().map(|ext| ext == "png").unwrap_or(false)
+            e.file_name().to_string_lossy().starts_with("Screenshot")
+                && e.path()
+                    .extension()
+                    .map(|ext| ext == "png")
+                    .unwrap_or(false)
         })
         .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
 

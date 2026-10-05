@@ -734,11 +734,8 @@ mod tests {
             Duration::from_millis(10),
         );
         entry.diarization = Some(
-            DiarizationSummary::new(
-                vec![DiarizationSegment::new("Speaker 0", 0.0, 1.0)],
-                true,
-            )
-            .with_fallback_reason("recording too short for diarization"),
+            DiarizationSummary::new(vec![DiarizationSegment::new("Speaker 0", 0.0, 1.0)], true)
+                .with_fallback_reason("recording too short for diarization"),
         );
 
         log.append(&entry).expect("append entry");

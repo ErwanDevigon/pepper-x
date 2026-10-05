@@ -110,9 +110,7 @@ impl OverlayView {
 
         let copy_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
         copy_box.set_hexpand(true);
-        let headline = gtk::Label::builder()
-            .xalign(0.0)
-            .build();
+        let headline = gtk::Label::builder().xalign(0.0).build();
         headline.add_css_class("title-3");
         let detail = gtk::Label::builder().xalign(0.0).wrap(true).build();
         detail.add_css_class("caption");
@@ -148,7 +146,7 @@ impl OverlayView {
 
         // Colored status dot: red for recording, green for success, yellow for error
         let dot_color = match status {
-            LiveStatus::Recording => Some("#e01b24"),       // red
+            LiveStatus::Recording => Some("#e01b24"),            // red
             LiveStatus::ClipboardFallback(_) => Some("#2ec27e"), // green
             LiveStatus::Error(_) | LiveStatus::Notice(_) => Some("#e5a50a"), // yellow
             _ => None,

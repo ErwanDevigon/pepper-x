@@ -144,7 +144,9 @@ impl SettingsView {
         surface_state: SettingsSurfaceState,
         history_widget: Option<gtk::Widget>,
         _rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
-        _rerun_cleanup: Option<Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>>,
+        _rerun_cleanup: Option<
+            Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>,
+        >,
         _play_audio: Option<Rc<dyn Fn(std::path::PathBuf)>>,
         diagnostics_summary: String,
         shared_trigger_config: Option<SharedTriggerConfig>,
@@ -170,16 +172,13 @@ impl SettingsView {
         let trigger_list = gtk::ListBox::new();
         trigger_list.add_css_class("boxed-list");
 
-        let hold_initial_label =
-            trigger_keys_display_name(&surface_state.hold_trigger_keys);
+        let hold_initial_label = trigger_keys_display_name(&surface_state.hold_trigger_keys);
         let hold_trigger_button = gtk::Button::builder()
             .label(&hold_initial_label)
             .hexpand(true)
             .build();
         hold_trigger_button.set_focusable(true);
-        let hold_trigger_value = Rc::new(RefCell::new(
-            surface_state.hold_trigger_keys.clone(),
-        ));
+        let hold_trigger_value = Rc::new(RefCell::new(surface_state.hold_trigger_keys.clone()));
         let hold_trigger_row = adw::ActionRow::builder()
             .title("Hold to Record")
             .subtitle("Hold this key combination to record, release to stop")
@@ -187,16 +186,13 @@ impl SettingsView {
         hold_trigger_row.add_suffix(&hold_trigger_button);
         trigger_list.append(&list_box_row(&hold_trigger_row));
 
-        let toggle_initial_label =
-            trigger_keys_display_name(&surface_state.toggle_trigger_keys);
+        let toggle_initial_label = trigger_keys_display_name(&surface_state.toggle_trigger_keys);
         let toggle_trigger_button = gtk::Button::builder()
             .label(&toggle_initial_label)
             .hexpand(true)
             .build();
         toggle_trigger_button.set_focusable(true);
-        let toggle_trigger_value = Rc::new(RefCell::new(
-            surface_state.toggle_trigger_keys.clone(),
-        ));
+        let toggle_trigger_value = Rc::new(RefCell::new(surface_state.toggle_trigger_keys.clone()));
         let toggle_trigger_row = adw::ActionRow::builder()
             .title("Toggle Recording")
             .subtitle("Press once to start recording, press again to stop")
@@ -308,9 +304,7 @@ impl SettingsView {
         let window_context_switch = gtk::Switch::builder().valign(Align::Center).build();
         let window_context_row = adw::ActionRow::builder()
             .title("Window context")
-            .subtitle(
-                "Capture screen text to help the cleanup model disambiguate names and terms",
-            )
+            .subtitle("Capture screen text to help the cleanup model disambiguate names and terms")
             .activatable_widget(&window_context_switch)
             .build();
         window_context_row.add_suffix(&window_context_switch);
@@ -484,8 +478,7 @@ impl SettingsView {
             .map(|m| m.id)
             .collect();
         let asr_model_list = gtk::StringList::new(&asr_model_ids);
-        let asr_model_dropdown =
-            gtk::DropDown::new(Some(asr_model_list), None::<gtk::Expression>);
+        let asr_model_dropdown = gtk::DropDown::new(Some(asr_model_list), None::<gtk::Expression>);
         asr_model_dropdown.set_hexpand(true);
         let asr_model_index = asr_model_ids
             .iter()
@@ -846,12 +839,12 @@ impl SettingsView {
         self.asr_language_row.set_sensitive(multilingual);
         self.hold_trigger_button
             .set_label(&trigger_keys_display_name(&surface_state.hold_trigger_keys));
-        *self.hold_trigger_value.borrow_mut() =
-            surface_state.hold_trigger_keys.clone();
+        *self.hold_trigger_value.borrow_mut() = surface_state.hold_trigger_keys.clone();
         self.toggle_trigger_button
-            .set_label(&trigger_keys_display_name(&surface_state.toggle_trigger_keys));
-        *self.toggle_trigger_value.borrow_mut() =
-            surface_state.toggle_trigger_keys.clone();
+            .set_label(&trigger_keys_display_name(
+                &surface_state.toggle_trigger_keys,
+            ));
+        *self.toggle_trigger_value.borrow_mut() = surface_state.toggle_trigger_keys.clone();
         self.preferred_transcriptions_buffer
             .set_text(&surface_state.preferred_transcriptions_text);
         self.replacement_rules_buffer
@@ -1281,51 +1274,47 @@ impl SettingsView {
                         let status_label = status_label.clone();
                         let result_label = result_label.clone();
                         let (tx, rx) = mpsc::channel::<Result<String, String>>();
-                        std::thread::spawn(move || {
-                            match active.stop() {
-                                Ok(artifact) => {
-                                    let wav_path = artifact.wav_path();
-                                    match crate::transcription::transcribe_wav_to_log(wav_path) {
-                                        Ok(entry) => {
-                                            let _ = tx.send(Ok(entry.display_text().to_string()));
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(Err(e.to_string()));
-                                        }
+                        std::thread::spawn(move || match active.stop() {
+                            Ok(artifact) => {
+                                let wav_path = artifact.wav_path();
+                                match crate::transcription::transcribe_wav_to_log(wav_path) {
+                                    Ok(entry) => {
+                                        let _ = tx.send(Ok(entry.display_text().to_string()));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e.to_string()));
                                     }
                                 }
-                                Err(e) => {
-                                    let _ = tx.send(Err(e.to_string()));
-                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e.to_string()));
                             }
                         });
                         // Poll for result
-                        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
-                            match rx.try_recv() {
-                                Ok(Ok(text)) => {
-                                    status_label.set_visible(false);
-                                    result_label.remove_css_class("error");
-                                    result_label.set_label(&text);
-                                    result_label.set_visible(true);
-                                    gtk::glib::ControlFlow::Break
-                                }
-                                Ok(Err(error)) => {
-                                    status_label.set_visible(false);
-                                    result_label.add_css_class("error");
-                                    result_label.set_label(&error);
-                                    result_label.set_visible(true);
-                                    gtk::glib::ControlFlow::Break
-                                }
-                                Err(mpsc::TryRecvError::Empty) => {
-                                    gtk::glib::ControlFlow::Continue
-                                }
-                                Err(mpsc::TryRecvError::Disconnected) => {
-                                    status_label.set_visible(false);
-                                    result_label.add_css_class("error");
-                                    result_label.set_label("Test transcription failed unexpectedly");
-                                    result_label.set_visible(true);
-                                    gtk::glib::ControlFlow::Break
-                                }
+                        gtk::glib::timeout_add_local(Duration::from_millis(100), move || match rx
+                            .try_recv()
+                        {
+                            Ok(Ok(text)) => {
+                                status_label.set_visible(false);
+                                result_label.remove_css_class("error");
+                                result_label.set_label(&text);
+                                result_label.set_visible(true);
+                                gtk::glib::ControlFlow::Break
+                            }
+                            Ok(Err(error)) => {
+                                status_label.set_visible(false);
+                                result_label.add_css_class("error");
+                                result_label.set_label(&error);
+                                result_label.set_visible(true);
+                                gtk::glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                status_label.set_visible(false);
+                                result_label.add_css_class("error");
+                                result_label.set_label("Test transcription failed unexpectedly");
+                                result_label.set_visible(true);
+                                gtk::glib::ControlFlow::Break
                             }
                         });
                     }
@@ -1369,7 +1358,9 @@ impl SettingsView {
             "Toggle Recording",
             self.feedback_label.clone(),
             self.updating_settings.clone(),
-            |settings, value| { settings.hold_trigger_keys = value; },
+            |settings, value| {
+                settings.hold_trigger_keys = value;
+            },
             self.shared_trigger_config.clone(),
         );
 
@@ -1381,7 +1372,9 @@ impl SettingsView {
             "Hold to Record",
             self.feedback_label.clone(),
             self.updating_settings.clone(),
-            |settings, value| { settings.toggle_trigger_keys = value; },
+            |settings, value| {
+                settings.toggle_trigger_keys = value;
+            },
             self.shared_trigger_config.clone(),
         );
 
@@ -1479,9 +1472,8 @@ impl SettingsView {
             let feedback_label = self.feedback_label.clone();
             move |_| {
                 let store_root = corrections_store_path();
-                let mut store = CorrectionStore::load(&store_root).unwrap_or_else(|_| {
-                    CorrectionStore::new(&store_root)
-                });
+                let mut store = CorrectionStore::load(&store_root)
+                    .unwrap_or_else(|_| CorrectionStore::new(&store_root));
                 if let Err(error) = store.clear() {
                     feedback_label.set_label(&format!("Failed to clear corrections: {error}"));
                     feedback_label.set_visible(true);
@@ -1517,16 +1509,12 @@ pub fn settings_form_sections(surface_state: &SettingsSurfaceState) -> Vec<Setti
                 SettingsControl::ShortcutRecorder(SettingsShortcutRecorderControl {
                     title: "Hold to Record".into(),
                     subtitle: "Hold this key combination to record, release to stop".into(),
-                    current_shortcut: trigger_keys_display_name(
-                        &surface_state.hold_trigger_keys,
-                    ),
+                    current_shortcut: trigger_keys_display_name(&surface_state.hold_trigger_keys),
                 }),
                 SettingsControl::ShortcutRecorder(SettingsShortcutRecorderControl {
                     title: "Toggle Recording".into(),
                     subtitle: "Press once to start recording, press again to stop".into(),
-                    current_shortcut: trigger_keys_display_name(
-                        &surface_state.toggle_trigger_keys,
-                    ),
+                    current_shortcut: trigger_keys_display_name(&surface_state.toggle_trigger_keys),
                 }),
                 SettingsControl::Switch(SettingsSwitchControl {
                     title: "Sound effects".into(),
@@ -1535,9 +1523,7 @@ pub fn settings_form_sections(surface_state: &SettingsSurfaceState) -> Vec<Setti
                 }),
                 SettingsControl::Switch(SettingsSwitchControl {
                     title: "Ignore other speakers".into(),
-                    subtitle:
-                        "Filter out other voices during transcription (experimental)"
-                            .into(),
+                    subtitle: "Filter out other voices during transcription (experimental)".into(),
                     active: surface_state.ignore_other_speakers,
                 }),
             ],
@@ -1566,8 +1552,9 @@ pub fn settings_form_sections(surface_state: &SettingsSurfaceState) -> Vec<Setti
                 }),
                 SettingsControl::Switch(SettingsSwitchControl {
                     title: "Window context".into(),
-                    subtitle: "Capture screen text to help the cleanup model disambiguate names and terms"
-                        .into(),
+                    subtitle:
+                        "Capture screen text to help the cleanup model disambiguate names and terms"
+                            .into(),
                     active: surface_state.enable_window_context,
                 }),
                 SettingsControl::Select(SettingsSelectControl {
@@ -1609,8 +1596,9 @@ pub fn settings_form_sections(surface_state: &SettingsSurfaceState) -> Vec<Setti
                 }),
                 SettingsControl::Switch(SettingsSwitchControl {
                     title: "Learn from corrections after paste".into(),
-                    subtitle: "Automatically learn preferred spellings when you correct pasted text"
-                        .into(),
+                    subtitle:
+                        "Automatically learn preferred spellings when you correct pasted text"
+                            .into(),
                     active: surface_state.enable_post_paste_learning,
                 }),
             ],
@@ -1660,14 +1648,11 @@ pub fn settings_form_sections(surface_state: &SettingsSurfaceState) -> Vec<Setti
         },
         SettingsFormSection {
             title: "General".into(),
-            controls: vec![
-                SettingsControl::Switch(SettingsSwitchControl {
-                    title: "Launch at login".into(),
-                    subtitle: "Start Pepper X in the background when your GNOME session begins"
-                        .into(),
-                    active: surface_state.launch_at_login,
-                }),
-            ],
+            controls: vec![SettingsControl::Switch(SettingsSwitchControl {
+                title: "Launch at login".into(),
+                subtitle: "Start Pepper X in the background when your GNOME session begins".into(),
+                active: surface_state.launch_at_login,
+            })],
         },
         SettingsFormSection {
             title: "Diagnostics".into(),
@@ -1858,9 +1843,8 @@ fn install_shortcut_recorder(
                 // Conflict — revert and show error
                 let current = own_value.borrow().clone();
                 button.set_label(&trigger_keys_display_name(&current));
-                feedback_label.set_label(&format!(
-                    "This shortcut is already used for {other_label}"
-                ));
+                feedback_label
+                    .set_label(&format!("This shortcut is already used for {other_label}"));
                 feedback_label.add_css_class("error");
                 feedback_label.set_visible(true);
                 return;
@@ -1891,8 +1875,7 @@ fn install_shortcut_recorder(
                         *guard = (hold, toggle);
                     }
                 }
-                feedback_label
-                    .set_label("Saved settings");
+                feedback_label.set_label("Saved settings");
                 feedback_label.set_visible(true);
             }
         }
@@ -1972,9 +1955,7 @@ pub(crate) fn build_microphone_controls(section_title: &str, _meter_label: &str)
     let picker_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     picker_box.append(&picker_label);
     picker_box.append(&picker);
-    let picker_list_row = gtk::ListBoxRow::builder()
-        .child(&picker_box)
-        .build();
+    let picker_list_row = gtk::ListBoxRow::builder().child(&picker_box).build();
     picker_list_row.set_activatable(false);
     list.append(&picker_list_row);
 

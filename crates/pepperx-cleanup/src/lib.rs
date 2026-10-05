@@ -167,7 +167,8 @@ mod cleanup_runtime {
 
         assert!(prompt.contains("<OCR-RULES>"));
         assert!(prompt.contains("</OCR-RULES>"));
-        assert!(prompt.contains("<WINDOW-OCR-CONTENT>\nTerminal: ~/git/pepper-x\n</WINDOW-OCR-CONTENT>"));
+        assert!(prompt
+            .contains("<WINDOW-OCR-CONTENT>\nTerminal: ~/git/pepper-x\n</WINDOW-OCR-CONTENT>"));
     }
 
     #[test]
@@ -204,7 +205,9 @@ mod cleanup_runtime {
             cleanup_gpu_layers: 0,
         });
 
-        assert!(prompt.contains("<WINDOW-OCR-CONTENT>\nline before\nline after\n</WINDOW-OCR-CONTENT>"));
+        assert!(
+            prompt.contains("<WINDOW-OCR-CONTENT>\nline before\nline after\n</WINDOW-OCR-CONTENT>")
+        );
         assert!(prompt.contains("<OCR-RULES>"));
     }
 
@@ -215,9 +218,7 @@ mod cleanup_runtime {
             model_path: PathBuf::from("/tmp/pepper-x-present.gguf"),
             supporting_context_text: None,
             ocr_text: None,
-            correction_memory_text: Some(
-                "- pepper x -> Pepper X\n- chat gbt -> ChatGPT".into(),
-            ),
+            correction_memory_text: Some("- pepper x -> Pepper X\n- chat gbt -> ChatGPT".into()),
             prompt_profile: ORDINARY_DICTATION_PROMPT_PROFILE.into(),
             custom_prompt_text: None,
             cleanup_use_gpu: false,
