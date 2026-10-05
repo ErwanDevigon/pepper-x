@@ -386,4 +386,53 @@ mod cleanup_runtime {
         assert!(request.cleanup_use_gpu);
         assert_eq!(request.cleanup_gpu_layers, 33);
     }
+
+    #[test]
+    fn chunk_transcript_keeps_short_text_as_single_chunk() {
+        use crate::cleanup::chunk_transcript;
+
+        let text = "hello from pepper x, short dictation only";
+        let chunks = chunk_transcript(text, 2400);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], text);
+    }
+
+    #[test]
+    fn chunk_transcript_splits_long_text_near_sentence_boundary() {
+        use crate::cleanup::chunk_transcript;
+
+        // Build ~5000 chars with clear sentence boundaries.
+        let sentence = "Ceci est une phrase de test pour le nettoyage. ";
+        let text = sentence.repeat(120); // ~5520 chars
+        assert!(text.chars().count() > 2400);
+
+        let chunks = chunk_transcript(&text, 2400);
+        assert!(chunks.len() >= 2, "expected multiple chunks, got {}", chunks.len());
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= 2400,
+                "chunk too long: {} chars",
+                chunk.chars().count()
+            );
+            assert!(!chunk.is_empty());
+        }
+        // Rejoining with spaces should preserve most content (trim drops edges).
+        let rejoined = chunks.join(" ");
+        assert!(rejoined.contains("Ceci est une phrase"));
+        assert!(rejoined.chars().count() + 200 >= text.trim().chars().count());
+    }
+
+    #[test]
+    fn chunk_transcript_prefers_newline_boundaries() {
+        use crate::cleanup::chunk_transcript;
+
+        let line = "a".repeat(100);
+        let text = format!("{line}\n{line}\n{line}\n{line}\n{line}");
+        let chunks = chunk_transcript(&text, 250);
+        assert!(chunks.len() >= 2);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 250);
+        }
+    }
+
 }

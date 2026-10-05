@@ -25,6 +25,9 @@ const CLEANUP_CORRECTION_MEMORY_LIMIT: usize = 2048;
 const CLEANUP_CUSTOM_PROMPT_LIMIT: usize = 2048;
 /// Low temperature keeps cleanup deterministic (punctuation/accents stable).
 const CLEANUP_TEMPERATURE: f32 = 0.0;
+/// Soft char budget per cleanup helper call. Leaves room for the system prompt
+/// + chat template under the helper's n_ctx/n_batch of 2048 tokens.
+const CLEANUP_TRANSCRIPT_CHUNK_CHARS: usize = 2400;
 
 const DEFAULT_CLEANUP_HELPER_BIN: &str = "/usr/libexec/pepper-x/pepperx-cleanup-helper";
 
@@ -383,43 +386,44 @@ pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupErr
     let model_name =
         model_name_from_path(&request.model_path).unwrap_or_else(|| String::from("unknown"));
     let start = Instant::now();
-    let raw_chars = request.transcript_text.chars().count();
+    let transcript = request.transcript_text.trim();
+    let raw_chars = transcript.chars().count();
+    let chunks = chunk_transcript(transcript, CLEANUP_TRANSCRIPT_CHUNK_CHARS);
 
-    let prompt = cleanup_prompt(request);
-    let prompt_chars = prompt.chars().count();
+    if chunks.len() > 1 {
+        eprintln!(
+            "[Pepper X] cleanup chunking: raw_chars={} chunks={} chunk_limit={}",
+            raw_chars,
+            chunks.len(),
+            CLEANUP_TRANSCRIPT_CHUNK_CHARS
+        );
+    }
 
-    let helper_request = GenerateRequest {
-        action: "generate",
-        prompt,
-        model_path: request.model_path.clone(),
-        max_tokens: CLEANUP_MAX_TOKENS,
-        temperature: CLEANUP_TEMPERATURE,
-        use_gpu: request.cleanup_use_gpu,
-        gpu_layers: request.cleanup_gpu_layers,
-    };
+    let mut cleaned_parts: Vec<String> = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.iter().enumerate() {
+        let mut chunk_request = request.clone();
+        chunk_request.transcript_text = chunk.clone();
+        match generate_cleanup_chunk(&chunk_request, &model_name, index, chunks.len()) {
+            Ok(cleaned) => cleaned_parts.push(cleaned),
+            Err(error) => {
+                // Multi-chunk: keep going with raw chunk so long audio still inserts.
+                // Single-chunk: preserve prior fail-fast behavior.
+                if chunks.len() == 1 {
+                    return Err(error);
+                }
+                eprintln!(
+                    "[Pepper X] cleanup chunk {}/{} failed ({error}); using raw chunk",
+                    index + 1,
+                    chunks.len()
+                );
+                cleaned_parts.push(sanitize_insertable_text(chunk));
+            }
+        }
+    }
 
-    // JSON serialization preserves full Unicode (é, è, ç, œ, …) as UTF-8.
-    let request_json = serde_json::to_string(&helper_request).map_err(|error| {
-        CleanupError::SubprocessError {
-            message: format!("failed to serialize helper request: {error}"),
-        })?;
-
-    eprintln!(
-        "[Pepper X] cleanup generate: use_gpu={} gpu_layers={} raw_chars={} prompt_chars={} json_bytes={}",
-        request.cleanup_use_gpu,
-        request.cleanup_gpu_layers,
-        raw_chars,
-        prompt_chars,
-        request_json.len(),
-    );
-
-    let generated = spawn_cleanup_helper(&request_json, &model_name)?;
-
-    let cleaned_text = normalize_cleanup_output(&generated);
+    let cleaned_text = cleaned_parts.join(" ");
     if cleaned_text.is_empty() || cleaned_text == "..." {
-        // Fall back to raw transcript when model output is unusable.
-        // Insertion must still receive valid text.
-        let fallback = sanitize_insertable_text(request.transcript_text.trim());
+        let fallback = sanitize_insertable_text(transcript);
         eprintln!(
             "[Pepper X] cleanup empty/unusable output → raw fallback ({} chars, model={})",
             fallback.chars().count(),
@@ -435,12 +439,13 @@ pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupErr
     }
 
     eprintln!(
-        "[Pepper X] cleanup ok: {} → {} chars in {}ms (model={}, gpu={})",
+        "[Pepper X] cleanup ok: {} → {} chars in {}ms (model={}, gpu={}, chunks={})",
         raw_chars,
         cleaned_text.chars().count(),
         start.elapsed().as_millis(),
         model_name,
         request.cleanup_use_gpu,
+        chunks.len(),
     );
 
     Ok(CleanupResult {
@@ -451,6 +456,144 @@ pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupErr
         used_ocr: has_ocr_context(request),
     })
 }
+
+/// Run one helper generate for a (possibly chunked) transcript.
+fn generate_cleanup_chunk(
+    request: &CleanupRequest,
+    model_name: &str,
+    chunk_index: usize,
+    chunk_count: usize,
+) -> Result<String, CleanupError> {
+    let prompt = cleanup_prompt(request);
+    let prompt_chars = prompt.chars().count();
+    let raw_chars = request.transcript_text.chars().count();
+
+    let helper_request = GenerateRequest {
+        action: "generate",
+        prompt,
+        model_path: request.model_path.clone(),
+        max_tokens: CLEANUP_MAX_TOKENS,
+        temperature: CLEANUP_TEMPERATURE,
+        use_gpu: request.cleanup_use_gpu,
+        gpu_layers: request.cleanup_gpu_layers,
+    };
+
+    // JSON serialization preserves full Unicode (é, è, ç, œ, …) as UTF-8.
+    let request_json = serde_json::to_string(&helper_request).map_err(|error| {
+        CleanupError::SubprocessError {
+            message: format!("failed to serialize helper request: {error}"),
+        }
+    })?;
+
+    eprintln!(
+        "[Pepper X] cleanup generate: use_gpu={} gpu_layers={} raw_chars={} prompt_chars={} json_bytes={} chunk={}/{}",
+        request.cleanup_use_gpu,
+        request.cleanup_gpu_layers,
+        raw_chars,
+        prompt_chars,
+        request_json.len(),
+        chunk_index + 1,
+        chunk_count,
+    );
+
+    let generated = spawn_cleanup_helper(&request_json, model_name)?;
+    let cleaned_text = normalize_cleanup_output(&generated);
+    if cleaned_text.is_empty() || cleaned_text == "..." {
+        // Fall back to raw chunk when model output is unusable.
+        return Ok(sanitize_insertable_text(request.transcript_text.trim()));
+    }
+    Ok(cleaned_text)
+}
+
+/// Split a long transcript into char-budget chunks, preferring sentence/newline
+/// boundaries so each helper call fits under llama n_batch/n_ctx (~2048 tokens).
+pub(crate) fn chunk_transcript(text: &str, max_chars: usize) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if max_chars == 0 {
+        return vec![trimmed.to_string()];
+    }
+
+    let total = trimmed.chars().count();
+    if total <= max_chars {
+        return vec![trimmed.to_string()];
+    }
+
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+
+    while start < chars.len() {
+        let hard_end = (start + max_chars).min(chars.len());
+        if hard_end == chars.len() {
+            let piece: String = chars[start..].iter().collect();
+            let piece = piece.trim();
+            if !piece.is_empty() {
+                chunks.push(piece.to_string());
+            }
+            break;
+        }
+
+        // Prefer break at newline, then sentence end, then whitespace.
+        let window = &chars[start..hard_end];
+        let mut break_at = None;
+
+        // Search from the end of the window backward for a good boundary.
+        for i in (1..window.len()).rev() {
+            let ch = window[i];
+            if ch == '\n' {
+                break_at = Some(start + i + 1);
+                break;
+            }
+        }
+        if break_at.is_none() {
+            for i in (1..window.len()).rev() {
+                let ch = window[i];
+                if matches!(ch, '.' | '!' | '?' | '…') {
+                    // Include trailing whitespace after the sentence marker when present.
+                    let mut end = start + i + 1;
+                    while end < hard_end && chars[end].is_whitespace() {
+                        end += 1;
+                    }
+                    break_at = Some(end);
+                    break;
+                }
+            }
+        }
+        if break_at.is_none() {
+            for i in (1..window.len()).rev() {
+                if window[i].is_whitespace() {
+                    break_at = Some(start + i + 1);
+                    break;
+                }
+            }
+        }
+
+        let end = break_at.unwrap_or(hard_end);
+        // Avoid infinite loop if boundary collapses to start.
+        let end = if end <= start { hard_end } else { end };
+
+        let piece: String = chars[start..end].iter().collect();
+        let piece = piece.trim();
+        if !piece.is_empty() {
+            chunks.push(piece.to_string());
+        }
+        start = end;
+        // Skip extra whitespace between chunks.
+        while start < chars.len() && chars[start].is_whitespace() {
+            start += 1;
+        }
+    }
+
+    if chunks.is_empty() {
+        vec![trimmed.to_string()]
+    } else {
+        chunks
+    }
+}
+
 
 fn configured_cleanup_helper_bin_path() -> PathBuf {
     if let Some(path) = std::env::var_os("PEPPERX_CLEANUP_HELPER_BIN") {
