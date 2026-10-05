@@ -131,7 +131,6 @@ pub(crate) struct FocusedTargetSnapshot {
 }
 
 impl FocusedTargetSnapshot {
-    #[allow(dead_code)]
     pub(crate) fn supporting_context_text(&self, max_chars: usize) -> Option<String> {
         let before_text = self.before_text.as_deref()?;
         let caret_offset = self.caret_offset?;
@@ -343,7 +342,6 @@ fn friendly_insert_target_class_name(target_class: FriendlyInsertTargetClass) ->
     }
 }
 
-#[allow(dead_code)]
 fn supporting_context_excerpt(
     before_text: &str,
     caret_offset: i32,
@@ -1053,7 +1051,6 @@ fn focused_friendly_target(
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn inspect_focused_target() -> Result<FocusedTargetSnapshot, FriendlyInsertRunError> {
     let focused = unsafe { find_focused_accessible()? };
     inspect_focused_target_from_accessible(&focused)
