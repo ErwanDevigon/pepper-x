@@ -3212,7 +3212,7 @@ mod app_shell {
                 elapsed_ms: 42,
             },
             |_| {
-                Err(FriendlyInsertRunError::UnsupportedTarget(
+                Err(FriendlyInsertRunError::UnsupportedTarget(Box::new(
                     pepperx_platform_gnome::atspi::FriendlyInsertFailure {
                         backend_name: FRIENDLY_INSERT_BACKEND_NAME,
                         reason:
@@ -3224,7 +3224,7 @@ mod app_shell {
                         target_class: Some("unsupported"),
                         attempted_backends: Vec::new(),
                     },
-                ))
+                )))
             },
         )
         .expect("archive entry");

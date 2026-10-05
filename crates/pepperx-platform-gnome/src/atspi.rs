@@ -201,7 +201,8 @@ pub enum FriendlyInsertRunError {
     InvalidInsertText,
     InitializationFailed(i32),
     MissingFocusedTarget,
-    UnsupportedTarget(FriendlyInsertFailure),
+    // Boxed to keep `Result<_, FriendlyInsertRunError>` small (clippy::result_large_err).
+    UnsupportedTarget(Box<FriendlyInsertFailure>),
     SelectedBackendFailure {
         selection: FriendlyInsertSelection,
         target_application_name: String,
@@ -977,9 +978,9 @@ fn focused_friendly_target(
     };
     let target_class = snapshot.target_class;
     let selection = select_friendly_insert_backend(&target, policy).map_err(|error| {
-        FriendlyInsertRunError::UnsupportedTarget(
+        FriendlyInsertRunError::UnsupportedTarget(Box::new(
             error.with_target_application_name(snapshot.application_name.clone()),
-        )
+        ))
     })?;
     ensure_runtime_supported_backend(&selection, &snapshot.application_name)?;
     if matches!(
