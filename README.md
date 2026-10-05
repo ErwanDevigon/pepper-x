@@ -29,24 +29,35 @@ With an NVIDIA GPU and CUDA enabled, cleanup is typically ~0.1s instead of sever
 
 Ubuntu 25.04+ or Fedora 42+. GNOME 48+ on Wayland.
 
+**Rust 1.92 or newer is required** (gtk4-rs 0.11 / glib 0.22 set that minimum).
+Distribution `cargo` packages are usually older (Debian 13 ships 1.85), so install
+the toolchain with [rustup](https://rustup.rs) if `rustc --version` reports < 1.92.
+
 ```sh
 # Ubuntu
 sudo apt install \
-  build-essential cargo cmake \
+  build-essential cmake clang libclang-dev \
   libadwaita-1-dev libatspi2.0-dev libgirepository1.0-dev \
   libglib2.0-dev libgtk-4-dev libgtk4-layer-shell-dev \
-  libvulkan-dev libxkbcommon-dev \
+  libpipewire-0.3-dev libvulkan-dev libxkbcommon-dev \
   pkg-config tesseract-ocr \
   wl-clipboard xclip
 
+
 # Fedora
 sudo dnf install \
-  cargo cmake gcc gcc-c++ \
+  cmake gcc gcc-c++ clang clang-devel \
   at-spi2-core-devel glib2-devel gobject-introspection-devel \
-  gtk4-devel libadwaita-devel libxkbcommon-devel vulkan-loader-devel \
+  gtk4-devel libadwaita-devel libxkbcommon-devel pipewire-devel vulkan-loader-devel \
   pkgconf-pkg-config tesseract \
   wl-clipboard xclip
+
+# Rust toolchain (if your distro's rustc is older than 1.92)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
+
+`libpipewire-0.3-dev` / `pipewire-devel` is needed by the `pipewire` crate, and
+`libclang` by the bindgen step of `llama-cpp-sys-4`.
 
 `wl-clipboard` (`wl-copy`) and/or `xclip` (or `xsel`) are recommended so the uinput helper can paste glyphs that the active keyboard layout cannot type (accents on plain US QWERTY, CJK, Thai, etc.).
 
@@ -79,6 +90,7 @@ CUDA_HOME=/opt/cuda cargo build --release
 **Vulkan (AMD/Intel):** not enabled by default — the build needs `glslc` (shaderc / Vulkan SDK). See the comment in `crates/pepperx-cleanup-helper/Cargo.toml` to re-enable it.
 
 **Runtime:** in the app, open **Cleanup** → enable **Use GPU for cleanup**. Adjust **GPU layers** if needed (default offloads all layers).
+
 
 Your user must be in the `input` group for hotkey capture and text injection:
 
@@ -126,6 +138,14 @@ That's it. The app:
 2. Pre-warms the cleanup model in the background
 3. Listens for your trigger keys (Alt+Super by default)
 
+Only errors are printed to the terminal by default. Set `PEPPERX_VERBOSE=1` to also
+see progress and timing messages (per-dictation `perf:` line, streaming ASR timing,
+modifier start/stop, cleanup prefill, uinput keyboard layout detection):
+
+```sh
+PEPPERX_VERBOSE=1 pepper-x
+```
+
 ### Text insertion -multilingual support with dynamic XKB + smart clipboard fallback-
 
 Pepper X inserts the final transcript into the focused app using a fallback chain:
@@ -148,6 +168,7 @@ The uinput helper does **not** assume a fixed US keymap. On every insert it:
 Clipboard tools tried in order: `wl-copy`, `xclip`, `xsel`. Previous clipboard contents are restored after paste when possible.
 
 **Limits:** apps that block paste or use a non-Ctrl+V paste binding (many terminals want Ctrl+Shift+V) may still fail on unmappable glyphs; install a clipboard tool for best results when switching between layouts (AZERTY ↔ QWERTY) mid-session.
+
 
 ### Settings
 
