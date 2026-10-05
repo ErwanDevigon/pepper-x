@@ -1,7 +1,6 @@
 pub mod decoder;
 mod transcriber;
 pub mod speaker_filter;
-mod transcriber;
 
 pub use decoder::{
     convert_to_temp_mono_16k_wav, decode_audio_file, is_supported_audio_extension, write_mono_16k_wav,

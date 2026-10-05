@@ -95,7 +95,6 @@ impl HistoryBrowserModel {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn select_run(&mut self, run_id: &str) -> bool {
         let Some(index) = self.runs.iter().position(|run| run.run_id == run_id) else {
             return false;
