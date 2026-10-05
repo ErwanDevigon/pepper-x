@@ -895,27 +895,6 @@ pub fn experiment_rerun_archived_run(
     )
 }
 
-pub fn rerun_archived_cleanup_to_log(
-    request: ArchivedCleanupRerunRequest,
-) -> Result<TranscriptEntry, TranscriptionRunError> {
-    let cache_root = default_cache_root();
-    let explicit_cleanup_model = request.cleanup_model_id.is_some();
-    rerun_archived_cleanup_with(request, move |cleanup_model_id, cleanup_request| {
-        let cleanup_request = CleanupRequest {
-            model_path: if explicit_cleanup_model {
-                configured_requested_cleanup_model_path_for_model_id_with(
-                    cleanup_model_id,
-                    &cache_root,
-                )?
-            } else {
-                configured_cleanup_model_path_for_model_id(cleanup_model_id, &cache_root)?
-            },
-            ..cleanup_request
-        };
-        safe_run_cleanup(&cleanup_request)
-    })
-}
-
 /// Run cleanup against an archived run without writing a new history entry.
 /// Returns the ephemeral `TranscriptEntry` so the caller can display it
 /// inline.
@@ -940,6 +919,7 @@ pub fn experiment_rerun_archived_cleanup(
     })
 }
 
+#[cfg(test)]
 fn rerun_archived_cleanup_with<C>(
     request: ArchivedCleanupRerunRequest,
     cleanup: C,
@@ -1336,6 +1316,7 @@ where
     archive_transcript_entry_with_request(entry, runtime_metadata, None, None, None)
 }
 
+#[cfg(test)]
 fn archive_transcription_result_with_cleanup_and_friendly_insert<C, I>(
     result: TranscriptionResult,
     prompt_profile: Option<String>,
@@ -1671,6 +1652,7 @@ fn describe_asr_error(error: &TranscriptionError) -> String {
         }
     }
 }
+#[cfg(test)]
 fn configured_model_dir() -> Result<PathBuf, TranscriptionRunError> {
     match std::env::var_os("PEPPERX_PARAKEET_MODEL_DIR") {
         Some(value) if !value.is_empty() => return Ok(PathBuf::from(value)),
@@ -1727,6 +1709,7 @@ fn configured_requested_cleanup_model_path_for_model_id_with(
     resolve_cleanup_model_path_for_model_id_with(model_id, cache_root, false)
 }
 
+#[cfg(test)]
 fn configured_model_dir_with(
     settings: &AppSettings,
     cache_root: &Path,
@@ -1734,6 +1717,7 @@ fn configured_model_dir_with(
     configured_model_dir_for_model_id_with(&settings.preferred_asr_model, cache_root)
 }
 
+#[cfg(test)]
 fn configured_model_dir_for_model_id_with(
     model_id: &str,
     cache_root: &Path,
@@ -1776,6 +1760,7 @@ fn configured_cleanup_model_path_with(
     configured_cleanup_model_path_for_model_id(&settings.preferred_cleanup_model, cache_root)
 }
 
+#[cfg(test)]
 fn configured_cleanup_model_path_for_model_id_with(
     model_id: &str,
     cache_root: &Path,
@@ -3438,6 +3423,9 @@ mod app_shell {
     }
 
     #[test]
+    #[ignore = "performs real AT-SPI/uinput text insertion; without an accessibility bus \
+                libatspi aborts the whole test binary (SIGTRAP). Run manually inside a \
+                GNOME session with --ignored."]
     fn cleanup_insert_runtime_skips_cleanup_when_settings_disable_it() {
         let _guard = env_lock().lock().unwrap();
         let state_root = std::env::temp_dir().join(format!(

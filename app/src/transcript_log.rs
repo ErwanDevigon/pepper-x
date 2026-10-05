@@ -146,6 +146,7 @@ pub struct DiarizationSegment {
 }
 
 impl DiarizationSegment {
+    #[cfg(test)]
     pub fn new(speaker: impl Into<String>, start_secs: f64, end_secs: f64) -> Self {
         Self {
             speaker: speaker.into(),

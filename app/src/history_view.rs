@@ -69,6 +69,7 @@ impl HistoryBrowserModel {
         self.selected_index = 0;
     }
 
+    #[cfg(test)]
     pub(crate) fn visible_run_ids(&self) -> Vec<String> {
         self.runs.iter().map(|run| run.run_id.clone()).collect()
     }
@@ -79,6 +80,7 @@ impl HistoryBrowserModel {
             .map(|run| run.run_id.as_str())
     }
 
+    #[cfg(test)]
     pub(crate) fn selected_details_text(&self) -> Option<String> {
         let selected_run = self.selected_run()?;
         match self.comparison_runs_for_selected() {
@@ -89,6 +91,7 @@ impl HistoryBrowserModel {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn select_run(&mut self, run_id: &str) -> bool {
         let Some(index) = self.runs.iter().position(|run| run.run_id == run_id) else {
             return false;
@@ -136,11 +139,6 @@ impl HistoryBrowserModel {
         })
     }
 
-    pub(crate) fn selected_diarization(&self) -> Option<&DiarizationSummary> {
-        self.selected_run()
-            .and_then(|run| run.entry.diarization.as_ref())
-    }
-
     pub(crate) fn selected_recording_duration_secs(&self) -> f64 {
         self.selected_run()
             .and_then(|run| run.runtime_metadata.recording_elapsed_ms)
@@ -174,6 +172,7 @@ impl HistoryBrowserModel {
         self.runs.get(self.selected_index)
     }
 
+    #[cfg(test)]
     fn comparison_runs_for_selected(&self) -> Option<(&ArchivedRun, &ArchivedRun)> {
         let selected_run = self.selected_run()?;
         if let Some(parent_run_id) = selected_run.parent_run_id.as_deref() {
@@ -533,7 +532,9 @@ pub(crate) fn build_history_browser(
     }
 
     // Rerun cleanup button
-    if let Some(rerun_cleanup) = rerun_cleanup {
+    // The click handler runs the cleanup rerun itself on a worker thread; the
+    // callback only signals that cleanup reruns are enabled for this view.
+    if rerun_cleanup.is_some() {
         rerun_cleanup_button
             .set_sensitive(model.borrow().cleanup_rerunnable_run_id().is_some());
         {
@@ -1290,10 +1291,12 @@ fn populate_detail_for_run(
 // Text-only detail output (used by selected_details_text for tests)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 pub(crate) fn history_run_details_text(run: &ArchivedRun) -> String {
     details_text_single(run)
 }
 
+#[cfg(test)]
 fn details_text_single(run: &ArchivedRun) -> String {
     let entry = &run.entry;
     let mut details = format!("Original Raw Transcript:\n{}", entry.transcript_text);
@@ -1309,6 +1312,7 @@ fn details_text_single(run: &ArchivedRun) -> String {
     details
 }
 
+#[cfg(test)]
 fn details_text_comparison(original_run: &ArchivedRun, rerun: &ArchivedRun) -> String {
     let original_cleaned_text = original_run
         .entry
@@ -1339,6 +1343,7 @@ fn details_text_comparison(original_run: &ArchivedRun, rerun: &ArchivedRun) -> S
     details
 }
 
+#[cfg(test)]
 fn build_metadata_lines(run: &ArchivedRun) -> Vec<String> {
     let entry = &run.entry;
     let mut lines = vec![
@@ -1418,6 +1423,7 @@ fn build_metadata_lines(run: &ArchivedRun) -> Vec<String> {
     lines
 }
 
+#[cfg(test)]
 fn comparison_metadata_lines(original_run: &ArchivedRun, rerun: &ArchivedRun) -> Vec<String> {
     let original_cleanup_model = original_run
         .entry

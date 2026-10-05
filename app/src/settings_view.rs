@@ -140,16 +140,12 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(surface_state: SettingsSurfaceState) -> Self {
-        Self::new_with_extras(surface_state, None, None, None, None, String::new(), None)
-    }
-
     pub fn new_with_extras(
         surface_state: SettingsSurfaceState,
         history_widget: Option<gtk::Widget>,
         _rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
         _rerun_cleanup: Option<Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>>,
-        play_audio: Option<Rc<dyn Fn(std::path::PathBuf)>>,
+        _play_audio: Option<Rc<dyn Fn(std::path::PathBuf)>>,
         diagnostics_summary: String,
         shared_trigger_config: Option<SharedTriggerConfig>,
     ) -> Self {
@@ -876,7 +872,6 @@ impl SettingsView {
     }
 
     fn connect_settings_handlers(&self) {
-        let asr_model_dropdown = self.asr_model_dropdown.clone();
         let asr_model_ids = self.asr_model_ids.clone();
         let cleanup_switch = self.cleanup_switch.clone();
         let cleanup_use_gpu_switch = self.cleanup_use_gpu_switch.clone();

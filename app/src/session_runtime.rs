@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use pepperx_audio::recording::{
     start_recording, start_recording_with_chunk_sink, ActiveRecording, ChunkSink,
@@ -665,6 +665,7 @@ where
 mod session_runtime {
     use super::*;
     use std::cell::RefCell;
+    use std::path::Path;
     use std::rc::Rc;
     use std::time::Duration;
 

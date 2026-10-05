@@ -113,6 +113,7 @@ impl AppModel {
         self.setup_state.borrow().clone()
     }
 
+    #[cfg(test)]
     pub fn setup_title(&self) -> &'static str {
         match self.setup_state() {
             SetupState::SetupRequired => "Finish Pepper X setup",
@@ -121,6 +122,7 @@ impl AppModel {
         }
     }
 
+    #[cfg(test)]
     pub fn setup_description(&self) -> String {
         match self.setup_state() {
             SetupState::SetupRequired => {
@@ -192,6 +194,7 @@ impl RuntimeReadinessSummary {
 }
 
 impl SetupChecklist {
+    #[cfg(test)]
     pub fn new(trigger_ready: bool) -> Self {
         Self {
             trigger_ready,
@@ -222,6 +225,7 @@ impl SetupChecklist {
 }
 
 impl ModelBootstrapSummary {
+    #[cfg(test)]
     pub fn ready() -> Self {
         Self {
             asr_ready: true,

@@ -189,6 +189,7 @@ fn validated_png_path(path: &Path) -> Result<PathBuf, ScreenshotWindowError> {
     Ok(path.to_path_buf())
 }
 
+#[cfg(test)]
 fn interpret_screenshot_reply(
     success: bool,
     filename_used: impl Into<PathBuf>,
@@ -222,24 +223,6 @@ fn classify_dbus_error_name(name: &str) -> ScreenshotWindowError {
         | "org.freedesktop.DBus.Error.UnknownInterface"
         | "org.freedesktop.DBus.Error.UnknownMethod" => ScreenshotWindowError::Unavailable,
         other => ScreenshotWindowError::Dbus(other.to_owned()),
-    }
-}
-
-fn argument_name(argument: &str) -> &'static str {
-    if argument.contains("include_frame") {
-        "include_frame"
-    } else if argument.contains("include_cursor") {
-        "include_cursor"
-    } else if argument.contains("flash") {
-        "flash"
-    } else if argument.contains("filename_used") {
-        "filename_used"
-    } else if argument.contains("filename") && argument.contains("direction=\"in\"") {
-        "filename"
-    } else if argument.contains("success") {
-        "success"
-    } else {
-        "argument"
     }
 }
 

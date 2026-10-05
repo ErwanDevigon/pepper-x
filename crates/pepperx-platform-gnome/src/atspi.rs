@@ -6,12 +6,14 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::time::Duration;
 
-#[path = "context.rs"]
-pub(crate) mod context;
-
 const CONTROL_LEFT_KEYSYM: u32 = 65_507;
 const CONTROL_RIGHT_KEYSYM: u32 = 65_508;
+// The clipboard-paste backend is retired (UinputText is preferred, see
+// `backend_matches_target`) but kept, with its tests, so it can be revived.
+// Its pieces are marked `allow(dead_code)` instead of being deleted.
+#[allow(dead_code)]
 const V_KEYSYM: u32 = b'v' as u32;
+#[allow(dead_code)]
 const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(75);
 
 pub const FRIENDLY_INSERT_BACKEND_NAME: &str = "atspi-editable-text";
@@ -74,6 +76,7 @@ pub fn modifier_capture_probe(modifier_capture_supported: bool) -> RecoveryProbe
 enum FriendlyInsertBackend {
     EditableText,
     StringInjection,
+    #[allow(dead_code)] // retired clipboard-paste backend, never selected
     ClipboardPaste,
     UinputText,
 }
@@ -113,14 +116,6 @@ impl FriendlyInsertPolicy {
         }
     }
 
-    fn expected_application_id(self) -> &'static str {
-        match self.expectation {
-            FriendlyInsertExpectation::ExactApplication(target_application_id) => {
-                target_application_id
-            }
-            FriendlyInsertExpectation::LiveSupported => "supported-live-target",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -718,6 +713,7 @@ pub fn insert_text_into_friendly_target(
     }
 }
 
+#[allow(dead_code)] // retired clipboard-paste backend (exercised by tests)
 fn run_clipboard_paste_with_adapter<A: ClipboardPasteAdapter>(
     text: &str,
     selection: &FriendlyInsertSelection,
@@ -747,6 +743,7 @@ fn run_clipboard_paste_with_adapter<A: ClipboardPasteAdapter>(
     })
 }
 
+#[allow(dead_code)] // retired clipboard-paste backend
 fn clipboard_paste_adapter() -> Result<GdkClipboardPasteAdapter, FriendlyInsertRunError> {
     // GTK must be initialized on the main thread. If it's already initialized
     // (by the application), we can safely access the default display from any
@@ -886,6 +883,7 @@ struct FocusedFriendlyTarget {
     caret_offset: Option<i32>,
 }
 
+#[allow(dead_code)] // retired clipboard-paste backend
 trait ClipboardPasteAdapter {
     type Snapshot;
 
@@ -895,6 +893,7 @@ trait ClipboardPasteAdapter {
     fn restore(&mut self, snapshot: Option<Self::Snapshot>) -> Result<(), FriendlyInsertRunError>;
 }
 
+#[allow(dead_code)] // retired clipboard-paste backend
 struct GdkClipboardPasteAdapter {
     clipboard: gtk::gdk::Clipboard,
 }
@@ -1359,18 +1358,21 @@ unsafe fn generate_keyboard_string(text: *const c_char) -> Result<(), FriendlyIn
     generate_keyboard_event(0, text, ffi::ATSPI_KEY_STRING)
 }
 
+#[allow(dead_code)] // only used by the retired clipboard-paste backend
 unsafe fn generate_keyboard_key_press(
     keyval: glib::ffi::glong,
 ) -> Result<(), FriendlyInsertRunError> {
     generate_keyboard_event(keyval, std::ptr::null(), ffi::ATSPI_KEY_PRESS)
 }
 
+#[allow(dead_code)] // only used by the retired clipboard-paste backend
 unsafe fn generate_keyboard_key_release(
     keyval: glib::ffi::glong,
 ) -> Result<(), FriendlyInsertRunError> {
     generate_keyboard_event(keyval, std::ptr::null(), ffi::ATSPI_KEY_RELEASE)
 }
 
+#[allow(dead_code)] // only used by the retired clipboard-paste backend
 unsafe fn generate_keyboard_key_press_release(
     keyval: glib::ffi::glong,
 ) -> Result<(), FriendlyInsertRunError> {
@@ -1466,8 +1468,11 @@ mod ffi {
 
     pub const ATSPI_STATE_EDITABLE: AtspiStateType = 7;
     pub const ATSPI_STATE_FOCUSED: AtspiStateType = 12;
+    #[allow(dead_code)]
     pub const ATSPI_KEY_PRESS: AtspiKeySynthType = 0;
+    #[allow(dead_code)]
     pub const ATSPI_KEY_RELEASE: AtspiKeySynthType = 1;
+    #[allow(dead_code)]
     pub const ATSPI_KEY_PRESSRELEASE: AtspiKeySynthType = 2;
     pub const ATSPI_KEY_STRING: AtspiKeySynthType = 4;
 

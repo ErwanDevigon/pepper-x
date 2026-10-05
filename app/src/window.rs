@@ -16,6 +16,7 @@ use crate::history_store::ArchivedRun;
 use crate::settings::AppSettings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum PageScaffoldKind {
     Form,
 }
@@ -23,11 +24,13 @@ enum PageScaffoldKind {
 /// All content now lives inside the SettingsView sidebar. These variants
 /// exist for test-level introspection of the window's logical sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum WindowPage {
     Settings,
     History,
 }
 
+#[cfg(test)]
 impl WindowPage {
     fn container_kind(self) -> PageScaffoldKind {
         match self {
@@ -88,6 +91,7 @@ impl MainWindow {
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_history_and_settings(
         app: &adw::Application,
         history_runs: Vec<ArchivedRun>,
@@ -292,6 +296,7 @@ impl MainWindow {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn settings_summary_text(
     settings: &AppSettings,
     cache_root: &Path,
@@ -396,6 +401,7 @@ pub(crate) fn diagnostics_summary_text(
     lines.join("\n")
 }
 
+#[cfg(test)]
 pub(crate) fn history_summary_text(runs: &[ArchivedRun]) -> String {
     if let Some(latest) = runs.first() {
         let entry = &latest.entry;

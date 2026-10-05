@@ -187,6 +187,7 @@ impl TriggerConfig {
     }
 
     /// Check if a keycode is part of the trigger combo.
+    #[cfg(test)]
     fn is_trigger_key(&self, keycode: u16) -> bool {
         self.group_for_keycode(keycode).is_some()
     }

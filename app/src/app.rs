@@ -18,7 +18,7 @@ use crate::onboarding::show_onboarding_window;
 use crate::session_runtime::LiveRuntimeHandle;
 use crate::settings::{AppSettings, AppSetupState};
 use crate::startup_policy::startup_launch_policy;
-use crate::transcript_log::{state_root, TranscriptEntry};
+use crate::transcript_log::state_root;
 use crate::transcription::{
     experiment_rerun_archived_cleanup, experiment_rerun_archived_run,
     ArchivedCleanupRerunRequest, ArchivedRunRerunRequest,
@@ -302,7 +302,8 @@ pub fn load_history_runs() -> io::Result<Vec<ArchivedRun>> {
     HistoryStore::open(state_root())?.recent_runs()
 }
 
-pub fn load_history_entries() -> io::Result<Vec<TranscriptEntry>> {
+#[cfg(test)]
+pub fn load_history_entries() -> io::Result<Vec<crate::transcript_log::TranscriptEntry>> {
     HistoryStore::open(state_root())?.recent_entries()
 }
 

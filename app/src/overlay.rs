@@ -74,18 +74,9 @@ impl OverlayPresentation {
     }
 }
 
-const STATUS_CSS_CLASSES: &[&str] = &[
-    "status-ready",
-    "status-recording",
-    "status-working",
-    "status-success",
-    "status-error",
-];
-
 #[derive(Clone)]
 pub struct OverlayView {
     root: gtk::Revealer,
-    frame: gtk::Box,
     status_dot: gtk::Label,
     spinner: gtk::Spinner,
     headline: gtk::Label,
@@ -135,7 +126,6 @@ impl OverlayView {
 
         Self {
             root,
-            frame,
             status_dot,
             spinner,
             headline,

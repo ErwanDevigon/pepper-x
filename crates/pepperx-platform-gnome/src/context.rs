@@ -1,17 +1,13 @@
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use zbus::blocking::Connection;
 
 use crate::atspi::{
     inspect_focused_target, FocusedTargetSnapshot, FriendlyInsertRunError, ProbeStatus,
     RecoveryAction, RecoveryProbe,
 };
 use crate::screenshot::{
-    introspect_interface_xml, screenshot_window, validate_interface_xml, ScreenshotContractError,
+    validate_interface_xml, ScreenshotContractError,
     ScreenshotWindowError,
 };
 
@@ -67,6 +63,9 @@ pub fn capture_supporting_context() -> Result<SupportingContext, ContextCaptureE
     Ok(SupportingContext::default())
 }
 
+// Parked OCR fallback (see the TODO in `capture_supporting_context`): kept with
+// its tests until a silent screenshot method exists.
+#[allow(dead_code)]
 pub(crate) fn context_capture_probe(
     snapshot: Option<&FocusedTargetSnapshot>,
     screenshot_contract_xml: &str,
@@ -123,6 +122,9 @@ pub(crate) fn supporting_context_from_atspi(
     }
 }
 
+// Parked OCR fallback (see the TODO in `capture_supporting_context`): kept with
+// its tests until a silent screenshot method exists.
+#[allow(dead_code)]
 pub(crate) fn capture_supporting_context_with<S, O>(
     snapshot: Option<FocusedTargetSnapshot>,
     screenshot_contract_xml: &str,
@@ -155,6 +157,9 @@ fn bound_text(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars.max(1)).collect()
 }
 
+// Parked OCR fallback (see the TODO in `capture_supporting_context`): kept with
+// its tests until a silent screenshot method exists.
+#[allow(dead_code)]
 fn ocr_png_with_tesseract(image_path: &Path) -> Result<Option<String>, ContextCaptureError> {
     let output = Command::new("tesseract")
         .arg(image_path)
@@ -181,6 +186,9 @@ fn ocr_png_with_tesseract(image_path: &Path) -> Result<Option<String>, ContextCa
     }
 }
 
+// Parked OCR fallback (see the TODO in `capture_supporting_context`): kept with
+// its tests until a silent screenshot method exists.
+#[allow(dead_code)]
 fn temporary_screenshot_path() -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

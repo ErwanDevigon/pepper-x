@@ -276,6 +276,7 @@ impl HistoryStore {
         Ok(runs)
     }
 
+    #[cfg(test)]
     pub fn recent_entries(&self) -> io::Result<Vec<TranscriptEntry>> {
         Ok(self
             .recent_runs()?

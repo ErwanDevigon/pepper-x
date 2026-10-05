@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const CLEANUP_BACKEND_NAME: &str = "llama.cpp";
 pub const ORDINARY_DICTATION_PROMPT_PROFILE: &str = "ordinary-dictation";
@@ -16,7 +16,6 @@ const CLEANUP_CORRECTION_MEMORY_LIMIT: usize = 2048;
 const CLEANUP_CUSTOM_PROMPT_LIMIT: usize = 2048;
 /// Low temperature keeps cleanup deterministic (punctuation/accents stable).
 const CLEANUP_TEMPERATURE: f32 = 0.0;
-const CLEANUP_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DEFAULT_CLEANUP_HELPER_BIN: &str = "/usr/libexec/pepper-x/pepperx-cleanup-helper";
 
@@ -608,44 +607,6 @@ fn send_to_helper_raw(request_json: &str) -> Result<String, CleanupError> {
     }
 
     result
-}
-
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> Result<std::process::Output, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Child has exited; collect output.
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    std::io::Read::read_to_end(&mut out, &mut stdout).ok();
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    std::io::Read::read_to_end(&mut err, &mut stderr).ok();
-                }
-                return Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
-            Ok(None) => {
-                if Instant::now() > deadline {
-                    return Err(format!(
-                        "cleanup helper timed out after {timeout:?}"
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => {
-                return Err(format!("failed to wait on cleanup helper: {error}"));
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
