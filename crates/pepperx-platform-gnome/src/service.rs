@@ -9,6 +9,15 @@ use zbus::{
     fdo, interface,
 };
 
+/// Informational (non-error) logging is opt-in: set `PEPPERX_VERBOSE=1` to
+/// print progress/timing messages. Errors are always printed.
+fn verbose_logging() -> bool {
+    static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERBOSE.get_or_init(|| {
+        std::env::var_os("PEPPERX_VERBOSE").is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     ShowSettings,
@@ -105,14 +114,16 @@ impl PepperXService {
 
     pub fn start_modifier_only_recording(&self) {
         match self.start_session(TriggerSource::ModifierOnly) {
-            Ok(()) => eprintln!("[Pepper X] modifier-only start"),
+            Ok(()) if verbose_logging() => eprintln!("[Pepper X] modifier-only start"),
+            Ok(()) => {}
             Err(error) => eprintln!("[Pepper X] modifier-only start failed: {error}"),
         }
     }
 
     pub fn stop_modifier_only_recording(&self) {
         match self.stop_session() {
-            Ok(()) => eprintln!("[Pepper X] modifier-only stop"),
+            Ok(()) if verbose_logging() => eprintln!("[Pepper X] modifier-only stop"),
+            Ok(()) => {}
             Err(error) => eprintln!("[Pepper X] modifier-only stop failed: {error}"),
         }
     }
@@ -148,7 +159,9 @@ impl PepperXService {
         match self.state.recording_runtime.start_recording(trigger_source) {
             Ok(()) => Ok(()),
             Err(RecordingRuntimeError::DuplicateStart) => {
-                eprintln!("[Pepper X] duplicate request ignored: start");
+                if verbose_logging() {
+                    eprintln!("[Pepper X] duplicate request ignored: start");
+                }
                 Ok(())
             }
             Err(RecordingRuntimeError::DuplicateStop) => Err(fdo::Error::Failed(
@@ -164,7 +177,9 @@ impl PepperXService {
         match self.state.recording_runtime.stop_recording() {
             Ok(()) => Ok(()),
             Err(RecordingRuntimeError::DuplicateStop) => {
-                eprintln!("[Pepper X] duplicate request ignored: stop");
+                if verbose_logging() {
+                    eprintln!("[Pepper X] duplicate request ignored: stop");
+                }
                 Ok(())
             }
             Err(RecordingRuntimeError::DuplicateStart) => Err(fdo::Error::Failed(

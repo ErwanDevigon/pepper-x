@@ -36,6 +36,15 @@ use crate::transcript_log::{
     LearningDiagnostics, TranscriptEntry,
 };
 
+/// Informational (non-error) logging is opt-in: set `PEPPERX_VERBOSE=1` to
+/// print progress/timing messages. Errors are always printed.
+pub(crate) fn verbose_logging() -> bool {
+    static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERBOSE.get_or_init(|| {
+        std::env::var_os("PEPPERX_VERBOSE").is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
 #[cfg(test)]
 const MODEL_NAME: &str = "nemotron-speech-streaming-en-0.6b";
 const DEFAULT_UINPUT_HELPER_BIN: &str = "/usr/libexec/pepper-x/pepperx-uinput-helper";
@@ -377,16 +386,18 @@ fn transcribe_recorded_wav_to_log_with_live_status(
         let filtered_wav = original_wav.with_extension("filtered.wav");
         match filter_other_speakers(&original_wav, &filtered_wav) {
             Ok(result) => {
-                if result.filtering_applied {
-                    eprintln!(
-                        "[Pepper X] speaker filter: kept {}/{} segments ({:.1}s -> {:.1}s)",
-                        result.target_speaker_segments,
-                        result.segment_count,
-                        result.original_duration.as_secs_f64(),
-                        result.filtered_duration.as_secs_f64(),
-                    );
-                } else if let Some(reason) = result.fallback_reason.as_deref() {
-                    eprintln!("[Pepper X] speaker filter: fallback ({reason})");
+                if verbose_logging() {
+                    if result.filtering_applied {
+                        eprintln!(
+                            "[Pepper X] speaker filter: kept {}/{} segments ({:.1}s -> {:.1}s)",
+                            result.target_speaker_segments,
+                            result.segment_count,
+                            result.original_duration.as_secs_f64(),
+                            result.filtered_duration.as_secs_f64(),
+                        );
+                    } else if let Some(reason) = result.fallback_reason.as_deref() {
+                        eprintln!("[Pepper X] speaker filter: fallback ({reason})");
+                    }
                 }
                 Some(result)
             }
@@ -512,14 +523,16 @@ fn transcribe_recorded_wav_to_log_with_live_status(
     });
 
     let total_elapsed = pipeline_start.elapsed();
-    eprintln!(
-        "[Pepper X] perf: record={:.1}s transcribe={:.1}s cleanup={:.1}s insert={:.1}s total={:.1}s",
-        recording_elapsed.as_secs_f64(),
-        transcribe_elapsed.get().as_secs_f64(),
-        cleanup_elapsed.get().as_secs_f64(),
-        insert_elapsed.get().as_secs_f64(),
-        total_elapsed.as_secs_f64(),
-    );
+    if verbose_logging() {
+        eprintln!(
+            "[Pepper X] perf: record={:.1}s transcribe={:.1}s cleanup={:.1}s insert={:.1}s total={:.1}s",
+            recording_elapsed.as_secs_f64(),
+            transcribe_elapsed.get().as_secs_f64(),
+            cleanup_elapsed.get().as_secs_f64(),
+            insert_elapsed.get().as_secs_f64(),
+            total_elapsed.as_secs_f64(),
+        );
+    }
 
     match result {
         Ok(entry) => {
@@ -764,11 +777,14 @@ fn streaming_transcript_or_batch(
     wav_path: &Path,
 ) -> Result<TranscriptionResult, TranscriptionRunError> {
     if let Some(st) = streaming {
-        eprintln!(
-            "[Pepper X] using streaming transcript ({} ms): {:?}",
-            st.elapsed_ms,
-            st.transcript_text.chars().take(80).collect::<String>(),
-        );
+        // Verbose-only: this echoes dictated text to the terminal/journal.
+        if verbose_logging() {
+            eprintln!(
+                "[Pepper X] using streaming transcript ({} ms): {:?}",
+                st.elapsed_ms,
+                st.transcript_text.chars().take(80).collect::<String>(),
+            );
+        }
         return Ok(TranscriptionResult {
             wav_path: wav_path.to_path_buf(),
             transcript_text: st.transcript_text.clone(),

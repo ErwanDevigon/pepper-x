@@ -5,6 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+/// Informational (non-error) logging is opt-in: set `PEPPERX_VERBOSE=1` to
+/// print progress/timing messages. Errors are always printed.
+fn verbose_logging() -> bool {
+    static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERBOSE.get_or_init(|| {
+        std::env::var_os("PEPPERX_VERBOSE").is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
 const CLEANUP_BACKEND_NAME: &str = "llama.cpp";
 pub const ORDINARY_DICTATION_PROMPT_PROFILE: &str = "ordinary-dictation";
 pub const LITERAL_DICTATION_PROMPT_PROFILE: &str = "literal-dictation";
@@ -312,13 +321,15 @@ pub fn prefill_cleanup_system_prompt(request: &CleanupRequest) {
         return;
     };
 
-    eprintln!(
-        "[Pepper X] cleanup prefill: use_gpu={} gpu_layers={} ({} bytes json, {} chars system)",
-        request.cleanup_use_gpu,
-        request.cleanup_gpu_layers,
-        json.len(),
-        prefill_system_char_len(&prefill),
-    );
+    if verbose_logging() {
+        eprintln!(
+            "[Pepper X] cleanup prefill: use_gpu={} gpu_layers={} ({} bytes json, {} chars system)",
+            request.cleanup_use_gpu,
+            request.cleanup_gpu_layers,
+            json.len(),
+            prefill_system_char_len(&prefill),
+        );
+    }
     if let Err(error) = send_to_helper(&json) {
         eprintln!("[Pepper X] cleanup prefill failed (non-fatal): {error}");
     }

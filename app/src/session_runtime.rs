@@ -72,9 +72,9 @@ fn spawn_streaming_transcriber(
         match transcriber.flush() {
             Ok(transcript_text) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
-                eprintln!(
-                    "[Pepper X] streaming ASR complete in {elapsed_ms} ms"
-                );
+                if crate::transcription::verbose_logging() {
+                    eprintln!("[Pepper X] streaming ASR complete in {elapsed_ms} ms");
+                }
                 let _ = result_tx.send(Some(StreamingTranscript {
                     transcript_text,
                     model_name,
