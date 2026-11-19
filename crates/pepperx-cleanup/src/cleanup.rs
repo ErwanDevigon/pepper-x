@@ -1,9 +1,20 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Informational (non-error) logging is opt-in: set `PEPPERX_VERBOSE=1` to
+/// print progress/timing messages. Errors are always printed.
+fn verbose_logging() -> bool {
+    static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERBOSE.get_or_init(|| {
+        std::env::var_os("PEPPERX_VERBOSE").is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
 
 const CLEANUP_BACKEND_NAME: &str = "llama.cpp";
 pub const ORDINARY_DICTATION_PROMPT_PROFILE: &str = "ordinary-dictation";
@@ -16,7 +27,11 @@ const CLEANUP_CORRECTION_MEMORY_LIMIT: usize = 2048;
 const CLEANUP_CUSTOM_PROMPT_LIMIT: usize = 2048;
 /// Low temperature keeps cleanup deterministic (punctuation/accents stable).
 const CLEANUP_TEMPERATURE: f32 = 0.0;
-const CLEANUP_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Soft char budget per cleanup helper call. Leaves room for the system prompt
+/// + chat template under the helper's n_ctx/n_batch of 2048 tokens.
+const CLEANUP_TRANSCRIPT_CHUNK_CHARS: usize = 2400;
+/// One helper chunk. A silent llama must not hold the process-global session lock longer than this.
+pub(crate) const CLEANUP_HELPER_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DEFAULT_CLEANUP_HELPER_BIN: &str = "/usr/libexec/pepper-x/pepperx-cleanup-helper";
 
@@ -66,6 +81,8 @@ pub enum CleanupError {
     SubprocessError {
         message: String,
     },
+    /// The helper produced no chunk before [`CLEANUP_HELPER_CHUNK_TIMEOUT`].
+    HelperChunkTimeout,
 }
 
 impl CleanupError {
@@ -79,7 +96,8 @@ impl CleanupError {
             | Self::UnsupportedModel(_)
             | Self::MissingModelPath(_)
             | Self::EmptyTranscript
-            | Self::SubprocessError { .. } => None,
+            | Self::SubprocessError { .. }
+            | Self::HelperChunkTimeout => None,
             Self::LoadModel { model_path, .. } => model_name_from_path(model_path),
             Self::CreateSession { model_name, .. }
             | Self::AdvanceContext { model_name, .. }
@@ -131,6 +149,7 @@ impl fmt::Display for CleanupError {
             Self::SubprocessError { message } => {
                 write!(f, "cleanup helper subprocess failed: {message}")
             }
+            Self::HelperChunkTimeout => f.write_str("cleanup helper timed out waiting for a chunk"),
         }
     }
 }
@@ -253,7 +272,7 @@ fn format_chat_prompt(system_prompt: &str, transcript: &str) -> String {
     format!(
         "<|im_start|>system\n{system_prompt}<|im_end|>\n\
          <|im_start|>user\n<USER-INPUT>\n{transcript}\n</USER-INPUT><|im_end|>\n\
-         <|im_start|>assistant\n"
+         <|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
 }
 
@@ -313,13 +332,15 @@ pub fn prefill_cleanup_system_prompt(request: &CleanupRequest) {
         return;
     };
 
-    eprintln!(
-        "[Pepper X] cleanup prefill: use_gpu={} gpu_layers={} ({} bytes json, {} chars system)",
-        request.cleanup_use_gpu,
-        request.cleanup_gpu_layers,
-        json.len(),
-        prefill_system_char_len(&prefill),
-    );
+    if verbose_logging() {
+        eprintln!(
+            "[Pepper X] cleanup prefill: use_gpu={} gpu_layers={} ({} bytes json, {} chars system)",
+            request.cleanup_use_gpu,
+            request.cleanup_gpu_layers,
+            json.len(),
+            prefill_system_char_len(&prefill),
+        );
+    }
     if let Err(error) = send_to_helper(&json) {
         eprintln!("[Pepper X] cleanup prefill failed (non-fatal): {error}");
     }
@@ -373,44 +394,44 @@ pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupErr
     let model_name =
         model_name_from_path(&request.model_path).unwrap_or_else(|| String::from("unknown"));
     let start = Instant::now();
-    let raw_chars = request.transcript_text.chars().count();
+    let transcript = request.transcript_text.trim();
+    let raw_chars = transcript.chars().count();
+    let chunks = chunk_transcript(transcript, CLEANUP_TRANSCRIPT_CHUNK_CHARS);
 
-    let prompt = cleanup_prompt(request);
-    let prompt_chars = prompt.chars().count();
+    if chunks.len() > 1 {
+        eprintln!(
+            "[Pepper X] cleanup chunking: raw_chars={} chunks={} chunk_limit={}",
+            raw_chars,
+            chunks.len(),
+            CLEANUP_TRANSCRIPT_CHUNK_CHARS
+        );
+    }
 
-    let helper_request = GenerateRequest {
-        action: "generate",
-        prompt,
-        model_path: request.model_path.clone(),
-        max_tokens: CLEANUP_MAX_TOKENS,
-        temperature: CLEANUP_TEMPERATURE,
-        use_gpu: request.cleanup_use_gpu,
-        gpu_layers: request.cleanup_gpu_layers,
-    };
-
-    // JSON serialization preserves full Unicode (é, è, ç, œ, …) as UTF-8.
-    let request_json = serde_json::to_string(&helper_request).map_err(|error| {
-        CleanupError::SubprocessError {
-            message: format!("failed to serialize helper request: {error}"),
+    let mut cleaned_parts: Vec<String> = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.iter().enumerate() {
+        let mut chunk_request = request.clone();
+        chunk_request.transcript_text = chunk.clone();
+        match generate_cleanup_chunk(&chunk_request, &model_name, index, chunks.len()) {
+            Ok(cleaned) => cleaned_parts.push(cleaned),
+            Err(error) => {
+                // Multi-chunk: keep going with raw chunk so long audio still inserts.
+                // Single-chunk: preserve prior fail-fast behavior.
+                if chunks.len() == 1 {
+                    return Err(error);
+                }
+                eprintln!(
+                    "[Pepper X] cleanup chunk {}/{} failed ({error}); using raw chunk",
+                    index + 1,
+                    chunks.len()
+                );
+                cleaned_parts.push(sanitize_insertable_text(chunk));
+            }
         }
-    })?;
+    }
 
-    eprintln!(
-        "[Pepper X] cleanup generate: use_gpu={} gpu_layers={} raw_chars={} prompt_chars={} json_bytes={}",
-        request.cleanup_use_gpu,
-        request.cleanup_gpu_layers,
-        raw_chars,
-        prompt_chars,
-        request_json.len(),
-    );
-
-    let generated = spawn_cleanup_helper(&request_json, &model_name)?;
-
-    let cleaned_text = normalize_cleanup_output(&generated);
+    let cleaned_text = cleaned_parts.join(" ");
     if cleaned_text.is_empty() || cleaned_text == "..." {
-        // Fall back to raw transcript when model output is unusable.
-        // Insertion must still receive valid text.
-        let fallback = sanitize_insertable_text(request.transcript_text.trim());
+        let fallback = sanitize_insertable_text(transcript);
         eprintln!(
             "[Pepper X] cleanup empty/unusable output → raw fallback ({} chars, model={})",
             fallback.chars().count(),
@@ -426,12 +447,13 @@ pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupErr
     }
 
     eprintln!(
-        "[Pepper X] cleanup ok: {} → {} chars in {}ms (model={}, gpu={})",
+        "[Pepper X] cleanup ok: {} → {} chars in {}ms (model={}, gpu={}, chunks={})",
         raw_chars,
         cleaned_text.chars().count(),
         start.elapsed().as_millis(),
         model_name,
         request.cleanup_use_gpu,
+        chunks.len(),
     );
 
     Ok(CleanupResult {
@@ -441,6 +463,142 @@ pub fn run_cleanup(request: &CleanupRequest) -> Result<CleanupResult, CleanupErr
         elapsed_ms: start.elapsed().as_millis() as u64,
         used_ocr: has_ocr_context(request),
     })
+}
+
+/// Run one helper generate for a (possibly chunked) transcript.
+fn generate_cleanup_chunk(
+    request: &CleanupRequest,
+    model_name: &str,
+    chunk_index: usize,
+    chunk_count: usize,
+) -> Result<String, CleanupError> {
+    let prompt = cleanup_prompt(request);
+    let prompt_chars = prompt.chars().count();
+    let raw_chars = request.transcript_text.chars().count();
+
+    let helper_request = GenerateRequest {
+        action: "generate",
+        prompt,
+        model_path: request.model_path.clone(),
+        max_tokens: CLEANUP_MAX_TOKENS,
+        temperature: CLEANUP_TEMPERATURE,
+        use_gpu: request.cleanup_use_gpu,
+        gpu_layers: request.cleanup_gpu_layers,
+    };
+
+    // JSON serialization preserves full Unicode (é, è, ç, œ, …) as UTF-8.
+    let request_json =
+        serde_json::to_string(&helper_request).map_err(|error| CleanupError::SubprocessError {
+            message: format!("failed to serialize helper request: {error}"),
+        })?;
+
+    eprintln!(
+        "[Pepper X] cleanup generate: use_gpu={} gpu_layers={} raw_chars={} prompt_chars={} json_bytes={} chunk={}/{}",
+        request.cleanup_use_gpu,
+        request.cleanup_gpu_layers,
+        raw_chars,
+        prompt_chars,
+        request_json.len(),
+        chunk_index + 1,
+        chunk_count,
+    );
+
+    let generated = spawn_cleanup_helper(&request_json, model_name)?;
+    let cleaned_text = normalize_cleanup_output(&generated);
+    if cleaned_text.is_empty() || cleaned_text == "..." {
+        // Fall back to raw chunk when model output is unusable.
+        return Ok(sanitize_insertable_text(request.transcript_text.trim()));
+    }
+    Ok(cleaned_text)
+}
+
+/// Split a long transcript into char-budget chunks, preferring sentence/newline
+/// boundaries so each helper call fits under llama n_batch/n_ctx (~2048 tokens).
+pub(crate) fn chunk_transcript(text: &str, max_chars: usize) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if max_chars == 0 {
+        return vec![trimmed.to_string()];
+    }
+
+    let total = trimmed.chars().count();
+    if total <= max_chars {
+        return vec![trimmed.to_string()];
+    }
+
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+
+    while start < chars.len() {
+        let hard_end = (start + max_chars).min(chars.len());
+        if hard_end == chars.len() {
+            let piece: String = chars[start..].iter().collect();
+            let piece = piece.trim();
+            if !piece.is_empty() {
+                chunks.push(piece.to_string());
+            }
+            break;
+        }
+
+        // Prefer break at newline, then sentence end, then whitespace.
+        let window = &chars[start..hard_end];
+        let mut break_at = None;
+
+        // Search from the end of the window backward for a good boundary.
+        for i in (1..window.len()).rev() {
+            let ch = window[i];
+            if ch == '\n' {
+                break_at = Some(start + i + 1);
+                break;
+            }
+        }
+        if break_at.is_none() {
+            for i in (1..window.len()).rev() {
+                let ch = window[i];
+                if matches!(ch, '.' | '!' | '?' | '…') {
+                    // Include trailing whitespace after the sentence marker when present.
+                    let mut end = start + i + 1;
+                    while end < hard_end && chars[end].is_whitespace() {
+                        end += 1;
+                    }
+                    break_at = Some(end);
+                    break;
+                }
+            }
+        }
+        if break_at.is_none() {
+            for i in (1..window.len()).rev() {
+                if window[i].is_whitespace() {
+                    break_at = Some(start + i + 1);
+                    break;
+                }
+            }
+        }
+
+        let end = break_at.unwrap_or(hard_end);
+        // Avoid infinite loop if boundary collapses to start.
+        let end = if end <= start { hard_end } else { end };
+
+        let piece: String = chars[start..end].iter().collect();
+        let piece = piece.trim();
+        if !piece.is_empty() {
+            chunks.push(piece.to_string());
+        }
+        start = end;
+        // Skip extra whitespace between chunks.
+        while start < chars.len() && chars[start].is_whitespace() {
+            start += 1;
+        }
+    }
+
+    if chunks.is_empty() {
+        vec![trimmed.to_string()]
+    } else {
+        chunks
+    }
 }
 
 fn configured_cleanup_helper_bin_path() -> PathBuf {
@@ -472,10 +630,7 @@ fn send_to_helper(request_json: &str) -> Result<CleanupHelperResponse, CleanupEr
     })
 }
 
-fn spawn_cleanup_helper(
-    request_json: &str,
-    model_name: &str,
-) -> Result<String, CleanupError> {
+fn spawn_cleanup_helper(request_json: &str, model_name: &str) -> Result<String, CleanupError> {
     let response = send_to_helper(request_json)?;
 
     if !response.ok {
@@ -497,20 +652,21 @@ fn spawn_cleanup_helper(
         });
     }
 
-    response
-        .text
-        .ok_or_else(|| CleanupError::EmptyCompletion {
-            model_name: model_name.into(),
-        })
+    response.text.ok_or_else(|| CleanupError::EmptyCompletion {
+        model_name: model_name.into(),
+    })
 }
 
 /// Long-lived helper subprocess with persistent stdin/stdout handles.
-/// Reusing the stdout `BufReader` avoids losing buffered bytes between requests.
+/// `pending` keeps stdout bytes past the current line so the next request does not lose them.
 struct HelperSession {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: io::BufReader<std::process::ChildStdout>,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    pending: Vec<u8>,
 }
+
+static HELPER_SESSION: Mutex<Option<HelperSession>> = Mutex::new(None);
 
 impl HelperSession {
     fn spawn(helper_bin: &Path) -> Result<Self, CleanupError> {
@@ -525,17 +681,67 @@ impl HelperSession {
                     helper_bin.display()
                 ),
             })?;
-        let stdin = child.stdin.take().ok_or_else(|| CleanupError::SubprocessError {
-            message: "cleanup helper stdin is not available".into(),
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| CleanupError::SubprocessError {
-            message: "cleanup helper stdout is not available".into(),
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CleanupError::SubprocessError {
+                message: "cleanup helper stdin is not available".into(),
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CleanupError::SubprocessError {
+                message: "cleanup helper stdout is not available".into(),
+            })?;
+        set_fd_nonblocking(stdout.as_raw_fd()).map_err(|error| CleanupError::SubprocessError {
+            message: format!("failed to set cleanup helper stdout nonblocking: {error}"),
         })?;
         Ok(Self {
             child,
             stdin,
-            stdout: io::BufReader::new(stdout),
+            stdout,
+            pending: Vec::new(),
         })
+    }
+
+    fn read_chunk_line(&mut self, timeout: Duration) -> Result<String, CleanupError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(line) = take_pending_line(&mut self.pending) {
+                return line;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(CleanupError::HelperChunkTimeout);
+            }
+            match wait_readable(self.stdout.as_raw_fd(), remaining).map_err(|error| {
+                CleanupError::SubprocessError {
+                    message: format!("failed to wait for cleanup helper: {error}"),
+                }
+            })? {
+                ReadWait::Timeout => return Err(CleanupError::HelperChunkTimeout),
+                ReadWait::Readable => {
+                    let mut buf = [0u8; 4096];
+                    let n = match read_retrying_eintr(&mut self.stdout, &mut buf) {
+                        Ok(n) => n,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(error) => {
+                            return Err(CleanupError::SubprocessError {
+                                message: format!("failed to read from cleanup helper: {error}"),
+                            });
+                        }
+                    };
+                    if n == 0 {
+                        if self.pending.is_empty() {
+                            return Ok(String::new());
+                        }
+                        let leftover = std::mem::take(&mut self.pending);
+                        return bytes_to_string(leftover);
+                    }
+                    self.pending.extend_from_slice(&buf[..n]);
+                }
+            }
+        }
     }
 
     fn is_alive(&mut self) -> bool {
@@ -546,14 +752,107 @@ impl HelperSession {
     }
 }
 
+enum ReadWait {
+    Readable,
+    Timeout,
+}
+
+fn take_pending_line(pending: &mut Vec<u8>) -> Option<Result<String, CleanupError>> {
+    let pos = pending.iter().position(|byte| *byte == b'\n')?;
+    let line: Vec<u8> = pending.drain(..=pos).collect();
+    Some(bytes_to_string(line))
+}
+
+fn bytes_to_string(bytes: Vec<u8>) -> Result<String, CleanupError> {
+    String::from_utf8(bytes).map_err(|error| CleanupError::SubprocessError {
+        message: format!("cleanup helper returned non-utf8: {error}"),
+    })
+}
+
+fn set_fd_nonblocking(fd: std::os::raw::c_int) -> io::Result<()> {
+    // Linux fcntl / open flags. pepper-x runs on GNOME.
+    const F_GETFL: std::os::raw::c_int = 3;
+    const F_SETFL: std::os::raw::c_int = 4;
+    const O_NONBLOCK: std::os::raw::c_int = 0o4000;
+    unsafe {
+        let flags = fcntl(fd, F_GETFL, 0);
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn wait_readable(fd: std::os::raw::c_int, timeout: Duration) -> io::Result<ReadWait> {
+    const POLLIN: std::os::raw::c_short = 0x1;
+    let millis = c_int_from_timeout(timeout);
+    let mut poll_fd = PollFd {
+        fd,
+        events: POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { poll(&mut poll_fd, 1, millis) };
+    if rc < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(ReadWait::Readable);
+        }
+        return Err(error);
+    }
+    if rc == 0 {
+        return Ok(ReadWait::Timeout);
+    }
+    Ok(ReadWait::Readable)
+}
+
+fn c_int_from_timeout(timeout: Duration) -> std::os::raw::c_int {
+    let millis = timeout.as_millis();
+    if millis == 0 {
+        return 0;
+    }
+    millis.min(std::os::raw::c_int::MAX as u128) as std::os::raw::c_int
+}
+
+fn read_retrying_eintr(stdout: &mut ChildStdout, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match stdout.read(buf) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: std::os::raw::c_int,
+    events: std::os::raw::c_short,
+    revents: std::os::raw::c_short,
+}
+
+extern "C" {
+    fn poll(
+        fds: *mut PollFd,
+        nfds: std::os::raw::c_ulong,
+        timeout: std::os::raw::c_int,
+    ) -> std::os::raw::c_int;
+    // Variadic in C.
+    fn fcntl(fd: std::os::raw::c_int, cmd: std::os::raw::c_int, ...) -> std::os::raw::c_int;
+}
+
 fn send_to_helper_raw(request_json: &str) -> Result<String, CleanupError> {
-    use std::sync::Mutex;
+    send_to_helper_raw_within(request_json, CLEANUP_HELPER_CHUNK_TIMEOUT)
+}
 
-    static HELPER: Mutex<Option<HelperSession>> = Mutex::new(None);
-
+fn send_to_helper_raw_within(
+    request_json: &str,
+    timeout: Duration,
+) -> Result<String, CleanupError> {
     let helper_bin = configured_cleanup_helper_bin_path();
     // Poisoned lock must not crash insertion: recover and rebuild the session.
-    let mut guard = HELPER
+    let mut guard = HELPER_SESSION
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -566,9 +865,11 @@ fn send_to_helper_raw(request_json: &str) -> Result<String, CleanupError> {
     }
 
     let result = (|| {
-        let session = guard.as_mut().ok_or_else(|| CleanupError::SubprocessError {
-            message: "cleanup helper session missing after spawn".into(),
-        })?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| CleanupError::SubprocessError {
+                message: "cleanup helper session missing after spawn".into(),
+            })?;
 
         session
             .stdin
@@ -576,22 +877,20 @@ fn send_to_helper_raw(request_json: &str) -> Result<String, CleanupError> {
             .map_err(|error| CleanupError::SubprocessError {
                 message: format!("failed to write to cleanup helper: {error}"),
             })?;
-        session.stdin.write_all(b"\n").map_err(|error| {
-            CleanupError::SubprocessError {
-                message: format!("failed to write newline to cleanup helper: {error}"),
-            }
-        })?;
-        session.stdin.flush().map_err(|error| CleanupError::SubprocessError {
-            message: format!("failed to flush cleanup helper stdin: {error}"),
-        })?;
-
-        let mut response_line = String::new();
         session
-            .stdout
-            .read_line(&mut response_line)
+            .stdin
+            .write_all(b"\n")
             .map_err(|error| CleanupError::SubprocessError {
-                message: format!("failed to read from cleanup helper: {error}"),
+                message: format!("failed to write newline to cleanup helper: {error}"),
             })?;
+        session
+            .stdin
+            .flush()
+            .map_err(|error| CleanupError::SubprocessError {
+                message: format!("failed to flush cleanup helper stdin: {error}"),
+            })?;
+
+        let response_line = session.read_chunk_line(timeout)?;
 
         if response_line.is_empty() {
             return Err(CleanupError::SubprocessError {
@@ -604,48 +903,16 @@ fn send_to_helper_raw(request_json: &str) -> Result<String, CleanupError> {
 
     if result.is_err() {
         // Drop a broken session so the next request respawns cleanly.
-        *guard = None;
-    }
-
-    result
-}
-
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> Result<std::process::Output, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Child has exited; collect output.
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    std::io::Read::read_to_end(&mut out, &mut stdout).ok();
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    std::io::Read::read_to_end(&mut err, &mut stderr).ok();
-                }
-                return Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
-            Ok(None) => {
-                if Instant::now() > deadline {
-                    return Err(format!(
-                        "cleanup helper timed out after {timeout:?}"
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => {
-                return Err(format!("failed to wait on cleanup helper: {error}"));
+        // A timeout has to kill the helper first: dropping `Child` does not.
+        if let Some(mut session) = guard.take() {
+            if matches!(result, Err(CleanupError::HelperChunkTimeout)) {
+                let _ = session.child.kill();
+                let _ = session.child.wait();
             }
         }
     }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -657,9 +924,9 @@ fn normalize_cleanup_output(output: &str) -> String {
 
     let first_line = sanitized
         .lines()
-        .next()
-        .unwrap_or(&sanitized)
-        .trim()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !is_thinking_preamble(line))
+        .unwrap_or("")
         .trim_matches('"')
         .trim();
 
@@ -687,6 +954,11 @@ pub(crate) fn sanitize_insertable_text(text: &str) -> String {
         .to_string()
 }
 
+fn is_thinking_preamble(line: &str) -> bool {
+    let trimmed = line.trim().trim_matches(':').trim();
+    trimmed.eq_ignore_ascii_case("thinking process")
+}
+
 /// Strip matched `<think>...</think>` blocks and orphan leading `<think>` tags.
 pub(crate) fn strip_reasoning_tags(output: &str) -> String {
     let mut result = output.to_string();
@@ -706,7 +978,10 @@ pub(crate) fn strip_reasoning_tags(output: &str) -> String {
             // first newline after the tag (the model's internal reasoning).
             if result[..open_start].trim().is_empty() {
                 let after_tag = &result[open_end..];
-                let skip = after_tag.find('\n').map(|p| p + 1).unwrap_or(after_tag.len());
+                let skip = after_tag
+                    .find('\n')
+                    .map(|p| p + 1)
+                    .unwrap_or(after_tag.len());
                 result = after_tag[skip..].to_string();
             }
             break;
@@ -786,4 +1061,97 @@ fn model_name_from_path(model_path: &Path) -> Option<String> {
     model_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod helper_chunk_timeout {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn reset_cleanup_helper_session() {
+        let mut guard = HELPER_SESSION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(mut session) = guard.take() {
+            let _ = session.child.kill();
+            let _ = session.child.wait();
+        }
+    }
+
+    struct RestoreHelperBin(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreHelperBin {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("PEPPERX_CLEANUP_HELPER_BIN", value),
+                None => std::env::remove_var("PEPPERX_CLEANUP_HELPER_BIN"),
+            }
+            reset_cleanup_helper_session();
+        }
+    }
+
+    #[test]
+    fn cleanup_helper_chunk_timeout_kills_silent_helper_and_allows_retry() {
+        assert_eq!(CLEANUP_HELPER_CHUNK_TIMEOUT, Duration::from_secs(30));
+        let _restore = RestoreHelperBin(std::env::var_os("PEPPERX_CLEANUP_HELPER_BIN"));
+        reset_cleanup_helper_session();
+
+        let dir = std::env::temp_dir().join(format!(
+            "pepper-x-cleanup-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("silent.pid");
+        let silent = write_script(
+            &dir,
+            "silent.sh",
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\nread line\nexec sleep 5\n",
+                pidfile.display()
+            ),
+        );
+        let reply = write_script(
+            &dir,
+            "reply.sh",
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"ok\":true,\"text\":\"pong\"}'\n",
+        );
+
+        std::env::set_var("PEPPERX_CLEANUP_HELPER_BIN", &silent);
+        let started = Instant::now();
+        let error = send_to_helper_raw_within("{\"ping\":1}", Duration::from_millis(800))
+            .expect_err("silent helper must time out");
+        let elapsed = started.elapsed();
+        assert_eq!(error, CleanupError::HelperChunkTimeout);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "timeout returned in {elapsed:?}"
+        );
+        let pid = std::fs::read_to_string(&pidfile)
+            .expect("silent helper pid")
+            .trim()
+            .to_string();
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "timed-out helper {pid} is still alive"
+        );
+
+        std::env::set_var("PEPPERX_CLEANUP_HELPER_BIN", &reply);
+        let line = send_to_helper_raw_within("{\"ping\":2}", Duration::from_secs(2))
+            .expect("next chunk can spawn a new helper");
+        assert!(line.contains("pong"), "{line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

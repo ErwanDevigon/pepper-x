@@ -6,6 +6,7 @@ use pepperx_models::{supported_models, ModelKind};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::history_store::{ArchivedRun, HistoryStore};
 use crate::settings::AppSettings;
@@ -18,6 +19,24 @@ pub(crate) enum HistoryListMode {
     Recordings,
     /// External audio imports via "Load audio file" (wav-import).
     AudioFiles,
+}
+
+/// Callback that reruns an archived run (run id, ASR model id).
+pub(crate) type RerunArchivedRunFn = Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>;
+/// Callback that reruns cleanup for an archived run (run id, cleanup model id, custom prompt).
+/// `Arc` so the history view can call it off the GTK thread.
+pub(crate) type RerunCleanupFn =
+    Arc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry> + Send + Sync>;
+
+/// Worker entry for the history "Run cleanup" click.
+/// Profile and errors stay inside `rerun_cleanup`; this only forwards the view's prompt.
+pub(crate) fn invoke_cleanup_rerun(
+    rerun_cleanup: &RerunCleanupFn,
+    run_id: String,
+    cleanup_model_id: String,
+    custom_prompt: Option<String>,
+) -> Option<TranscriptEntry> {
+    rerun_cleanup(run_id, cleanup_model_id, custom_prompt)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +82,13 @@ impl HistoryBrowserModel {
         self.rebuild_visible(previous_id.as_deref());
     }
 
+    pub(crate) fn clear_runs(&mut self) {
+        self.all_runs.clear();
+        self.runs.clear();
+        self.selected_index = 0;
+    }
+
+    #[cfg(test)]
     pub(crate) fn visible_run_ids(&self) -> Vec<String> {
         self.runs.iter().map(|run| run.run_id.clone()).collect()
     }
@@ -73,12 +99,11 @@ impl HistoryBrowserModel {
             .map(|run| run.run_id.as_str())
     }
 
+    #[cfg(test)]
     pub(crate) fn selected_details_text(&self) -> Option<String> {
         let selected_run = self.selected_run()?;
         match self.comparison_runs_for_selected() {
-            Some((original_run, rerun)) => {
-                Some(details_text_comparison(original_run, rerun))
-            }
+            Some((original_run, rerun)) => Some(details_text_comparison(original_run, rerun)),
             None => Some(details_text_single(selected_run)),
         }
     }
@@ -117,8 +142,7 @@ impl HistoryBrowserModel {
     }
 
     pub(crate) fn selected_asr_model(&self) -> Option<&str> {
-        self.selected_run()
-            .map(|run| run.entry.model_name.as_str())
+        self.selected_run().map(|run| run.entry.model_name.as_str())
     }
 
     pub(crate) fn selected_cleanup_model(&self) -> Option<&str> {
@@ -128,11 +152,6 @@ impl HistoryBrowserModel {
                 .as_ref()
                 .map(|cleanup| cleanup.model_name.as_str())
         })
-    }
-
-    pub(crate) fn selected_diarization(&self) -> Option<&DiarizationSummary> {
-        self.selected_run()
-            .and_then(|run| run.entry.diarization.as_ref())
     }
 
     pub(crate) fn selected_recording_duration_secs(&self) -> f64 {
@@ -168,6 +187,7 @@ impl HistoryBrowserModel {
         self.runs.get(self.selected_index)
     }
 
+    #[cfg(test)]
     fn comparison_runs_for_selected(&self) -> Option<(&ArchivedRun, &ArchivedRun)> {
         let selected_run = self.selected_run()?;
         if let Some(parent_run_id) = selected_run.parent_run_id.as_deref() {
@@ -208,7 +228,11 @@ fn is_audio_file_lineage(run: &ArchivedRun, all_runs: &[ArchivedRun]) -> bool {
         "archived-rerun" => run
             .parent_run_id
             .as_deref()
-            .and_then(|parent_id| all_runs.iter().find(|candidate| candidate.run_id == parent_id))
+            .and_then(|parent_id| {
+                all_runs
+                    .iter()
+                    .find(|candidate| candidate.run_id == parent_id)
+            })
             .map(|parent| is_audio_file_lineage(parent, all_runs))
             .unwrap_or(false),
         _ => false,
@@ -221,14 +245,14 @@ fn is_audio_file_lineage(run: &ArchivedRun, all_runs: &[ArchivedRun]) -> bool {
 
 pub(crate) fn build_history_browser(
     runs: &[ArchivedRun],
-    rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
-    rerun_cleanup: Option<Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>>,
+    rerun_archived_run: Option<RerunArchivedRunFn>,
+    rerun_cleanup: Option<RerunCleanupFn>,
     play_audio: Option<Rc<dyn Fn(PathBuf)>>,
 ) -> gtk::Box {
     let model = Rc::new(RefCell::new(HistoryBrowserModel::new(runs.to_vec())));
     let settings = AppSettings::load_or_default();
 
-    // --- Toolbar: Load audio (left) + mode switch Recordings | Audio files ---
+    // --- Toolbar: Load audio (left) | status | Recordings/Audio files | Purge ---
     let toolbar = gtk::Box::new(Orientation::Horizontal, 12);
     toolbar.set_margin_top(12);
     toolbar.set_margin_bottom(6);
@@ -258,9 +282,16 @@ pub(crate) fn build_history_browser(
     mode_box.append(&recordings_toggle);
     mode_box.append(&audio_files_toggle);
 
+    let purge_button = gtk::Button::builder()
+        .label("Purge history")
+        .css_classes(["destructive-action"])
+        .halign(Align::End)
+        .build();
+
     toolbar.append(&load_audio_button);
     toolbar.append(&load_status);
     toolbar.append(&mode_box);
+    toolbar.append(&purge_button);
 
     // --- Left side: run list ---
     let list_box = gtk::ListBox::builder()
@@ -306,12 +337,8 @@ pub(crate) fn build_history_browser(
         .filter(|m| m.kind == ModelKind::Asr)
         .map(|m| m.id.to_string())
         .collect();
-    let asr_string_list = gtk::StringList::new(
-        &asr_model_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-    );
+    let asr_string_list =
+        gtk::StringList::new(&asr_model_ids.iter().map(String::as_str).collect::<Vec<_>>());
     let asr_dropdown = gtk::DropDown::new(Some(asr_string_list), None::<gtk::Expression>);
     let initial_asr = model
         .borrow()
@@ -364,7 +391,9 @@ pub(crate) fn build_history_browser(
         .accepts_tab(false)
         .height_request(150)
         .build();
-    let initial_prompt = settings.effective_cleanup_custom_prompt().unwrap_or_default();
+    let initial_prompt = settings
+        .effective_cleanup_custom_prompt()
+        .unwrap_or_default();
     prompt_text_view.buffer().set_text(&initial_prompt);
 
     let prompt_frame = gtk::Frame::new(None);
@@ -377,9 +406,13 @@ pub(crate) fn build_history_browser(
     // "Use captured OCR" checkbox (shown only when entry has OCR data)
     let use_ocr_check = gtk::CheckButton::with_label("Use captured OCR");
     use_ocr_check.set_active(false);
-    use_ocr_check.set_visible(model.borrow().selected_run()
-        .and_then(|r| r.ocr_text.as_ref())
-        .is_some());
+    use_ocr_check.set_visible(
+        model
+            .borrow()
+            .selected_run()
+            .and_then(|r| r.ocr_text.as_ref())
+            .is_some(),
+    );
 
     // Cleanup model picker + buttons row
     let cleanup_model_ids: Vec<String> = supported_models()
@@ -502,11 +535,7 @@ pub(crate) fn build_history_browser(
                 if let Some(entry) = rerun_archived_run(run_id, asr_model_id) {
                     rerun_raw_card_label.set_label(&entry.transcript_text);
                     rerun_raw_card_frame.set_visible(true);
-                    if let Some(cleaned) = entry
-                        .cleanup
-                        .as_ref()
-                        .and_then(|c| c.cleaned_text())
-                    {
+                    if let Some(cleaned) = entry.cleanup.as_ref().and_then(|c| c.cleaned_text()) {
                         let original_text = original_cleaned_label.label();
                         let diff_markup = word_diff_markup(&original_text, cleaned);
                         rerun_cleaned_card_label.set_markup(&diff_markup);
@@ -519,10 +548,11 @@ pub(crate) fn build_history_browser(
         rerun_button.set_sensitive(false);
     }
 
-    // Rerun cleanup button
+    // Rerun cleanup button.
+    // Llama stays off the GTK thread. The worker calls `rerun_cleanup`, which
+    // loads the prompt profile from settings and reports errors on stderr.
     if let Some(rerun_cleanup) = rerun_cleanup {
-        rerun_cleanup_button
-            .set_sensitive(model.borrow().cleanup_rerunnable_run_id().is_some());
+        rerun_cleanup_button.set_sensitive(model.borrow().cleanup_rerunnable_run_id().is_some());
         {
             let model = model.clone();
             let cleanup_dropdown = cleanup_dropdown.clone();
@@ -532,6 +562,7 @@ pub(crate) fn build_history_browser(
             let rerun_cleaned_card_label = rerun_cleaned_card.1.clone();
             let original_cleaned_label = original_cleaned_card.1.clone();
             let cleanup_timing_label = cleanup_timing_label.clone();
+            let rerun_cleanup = Arc::clone(&rerun_cleanup);
             rerun_cleanup_button.connect_clicked(move |button| {
                 let run_id = {
                     let model = model.borrow();
@@ -563,24 +594,22 @@ pub(crate) fn build_history_browser(
                 let button = button.clone();
                 let rerun_cleaned_card_frame = rerun_cleaned_card_frame.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
+                let rerun_cleanup = Arc::clone(&rerun_cleanup);
                 std::thread::Builder::new()
                     .name("pepperx-cleanup-rerun".into())
                     .spawn(move || {
-                        use crate::transcription::{
-                            experiment_rerun_archived_cleanup, ArchivedCleanupRerunRequest,
-                        };
-                        let request = ArchivedCleanupRerunRequest {
+                        let result = invoke_cleanup_rerun(
+                            &rerun_cleanup,
                             run_id,
-                            cleanup_model_id: Some(cleanup_model_id),
-                            cleanup_prompt_profile: None,
-                            custom_prompt_text: custom_prompt,
-                        };
-                        let result = experiment_rerun_archived_cleanup(request).ok();
+                            cleanup_model_id,
+                            custom_prompt,
+                        );
                         let _ = tx.send(result);
                     })
                     .expect("failed to spawn cleanup rerun thread");
-                gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                    match rx.try_recv() {
+                gtk::glib::timeout_add_local(
+                    std::time::Duration::from_millis(100),
+                    move || match rx.try_recv() {
                         Ok(result) => {
                             button.set_sensitive(true);
                             button.set_label("Run cleanup");
@@ -588,14 +617,12 @@ pub(crate) fn build_history_browser(
                                 if let Some(cleanup) = entry.cleanup.as_ref() {
                                     if let Some(cleaned) = cleanup.cleaned_text() {
                                         let original_text = original_cleaned_label.label();
-                                        let diff_markup =
-                                            word_diff_markup(&original_text, cleaned);
+                                        let diff_markup = word_diff_markup(&original_text, cleaned);
                                         rerun_cleaned_card_label.set_markup(&diff_markup);
                                         rerun_cleaned_card_frame.set_visible(true);
                                     }
                                     let elapsed_secs = cleanup.elapsed_ms as f64 / 1000.0;
-                                    cleanup_timing_label
-                                        .set_label(&format!("{elapsed_secs:.1}s"));
+                                    cleanup_timing_label.set_label(&format!("{elapsed_secs:.1}s"));
                                     cleanup_timing_label.set_visible(true);
                                 }
                             }
@@ -609,8 +636,8 @@ pub(crate) fn build_history_browser(
                             button.set_label("Run cleanup");
                             gtk::glib::ControlFlow::Break
                         }
-                    }
-                });
+                    },
+                );
             });
         }
     } else {
@@ -796,21 +823,49 @@ pub(crate) fn build_history_browser(
                 .root()
                 .and_then(|root| root.downcast::<gtk::Window>().ok());
 
-            let filter = gtk::FileFilter::new();
-            filter.set_name(Some("WAV audio"));
-            filter.add_mime_type("audio/wav");
-            filter.add_mime_type("audio/x-wav");
-            filter.add_pattern("*.wav");
-            filter.add_pattern("*.WAV");
+            let all_audio = gtk::FileFilter::new();
+            all_audio.set_name(Some("Audio files"));
+            for mime in [
+                "audio/wav",
+                "audio/x-wav",
+                "audio/mpeg",
+                "audio/mp3",
+                "audio/flac",
+                "audio/x-flac",
+                "audio/ogg",
+                "audio/opus",
+                "audio/aac",
+                "audio/mp4",
+                "audio/x-m4a",
+                "audio/aiff",
+                "audio/x-aiff",
+            ] {
+                all_audio.add_mime_type(mime);
+            }
+            for pattern in [
+                "*.wav", "*.WAV", "*.wave", "*.mp3", "*.MP3", "*.flac", "*.FLAC", "*.ogg", "*.OGG",
+                "*.oga", "*.opus", "*.aac", "*.AAC", "*.m4a", "*.M4A", "*.mp4", "*.caf", "*.aiff",
+                "*.aif",
+            ] {
+                all_audio.add_pattern(pattern);
+            }
+
+            let wav_only = gtk::FileFilter::new();
+            wav_only.set_name(Some("WAV"));
+            wav_only.add_mime_type("audio/wav");
+            wav_only.add_mime_type("audio/x-wav");
+            wav_only.add_pattern("*.wav");
+            wav_only.add_pattern("*.WAV");
 
             let filters = gio::ListStore::new::<gtk::FileFilter>();
-            filters.append(&filter);
+            filters.append(&all_audio);
+            filters.append(&wav_only);
 
             let dialog = gtk::FileDialog::builder()
                 .title("Load audio file")
                 .modal(true)
                 .filters(&filters)
-                .default_filter(&filter)
+                .default_filter(&all_audio)
                 .build();
 
             let model = model.clone();
@@ -832,120 +887,214 @@ pub(crate) fn build_history_browser(
             let audio_files_toggle = audio_files_toggle.clone();
             let load_audio_button = button.clone();
 
-            dialog.open(
-                parent.as_ref(),
-                None::<&gio::Cancellable>,
-                move |result| {
-                    let Ok(file) = result else {
-                        return;
-                    };
-                    let Some(path) = file.path() else {
-                        load_status.set_label("Could not read selected path.");
-                        return;
-                    };
-                    if !is_supported_audio_path(&path) {
-                        load_status.set_label("Only WAV audio files are supported.");
-                        return;
-                    }
+            dialog.open(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+                let Ok(file) = result else {
+                    return;
+                };
+                let Some(path) = file.path() else {
+                    load_status.set_label("Could not read selected path.");
+                    return;
+                };
+                if !is_supported_audio_path(&path) {
+                    load_status
+                        .set_label("Unsupported audio type. Use WAV, MP3, FLAC, OGG, AAC/M4A…");
+                    return;
+                }
 
-                    load_status.set_label(&format!("Transcribing {}…", display_file_name(&path)));
-                    load_audio_button.set_sensitive(false);
+                load_status.set_label(&format!("Transcribing {}…", display_file_name(&path)));
+                load_audio_button.set_sensitive(false);
 
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let path_for_thread = path.clone();
-                    std::thread::Builder::new()
-                        .name("pepperx-audio-import".into())
-                        .spawn(move || {
-                            let result =
-                                crate::transcription::import_external_audio_file(&path_for_thread);
-                            let _ = tx.send(result);
-                        })
-                        .expect("failed to spawn audio import thread");
+                let (tx, rx) = std::sync::mpsc::channel();
+                let path_for_thread = path.clone();
+                std::thread::Builder::new()
+                    .name("pepperx-audio-import".into())
+                    .spawn(move || {
+                        let result =
+                            crate::transcription::import_external_audio_file(&path_for_thread);
+                        let _ = tx.send(result);
+                    })
+                    .expect("failed to spawn audio import thread");
 
-                    let model = model.clone();
-                    let list_box = list_box.clone();
-                    let metadata_line = metadata_line.clone();
-                    let transcription_subtitle = transcription_subtitle.clone();
-                    let original_raw_label = original_raw_label.clone();
-                    let cleanup_subtitle = cleanup_subtitle.clone();
-                    let original_cleaned_label = original_cleaned_label.clone();
-                    let diarization_container = diarization_container.clone();
-                    let use_ocr_check = use_ocr_check.clone();
-                    let play_button = play_button.clone();
-                    let rerun_button = rerun_button.clone();
-                    let rerun_cleanup_button = rerun_cleanup_button.clone();
-                    let rerun_raw_card_frame = rerun_raw_card_frame.clone();
-                    let rerun_cleaned_card_frame = rerun_cleaned_card_frame.clone();
-                    let cleanup_timing_label = cleanup_timing_label.clone();
-                    let load_status = load_status.clone();
-                    let audio_files_toggle = audio_files_toggle.clone();
-                    let load_audio_button = load_audio_button.clone();
-                    let source_path = path;
+                let model = model.clone();
+                let list_box = list_box.clone();
+                let metadata_line = metadata_line.clone();
+                let transcription_subtitle = transcription_subtitle.clone();
+                let original_raw_label = original_raw_label.clone();
+                let cleanup_subtitle = cleanup_subtitle.clone();
+                let original_cleaned_label = original_cleaned_label.clone();
+                let diarization_container = diarization_container.clone();
+                let use_ocr_check = use_ocr_check.clone();
+                let play_button = play_button.clone();
+                let rerun_button = rerun_button.clone();
+                let rerun_cleanup_button = rerun_cleanup_button.clone();
+                let rerun_raw_card_frame = rerun_raw_card_frame.clone();
+                let rerun_cleaned_card_frame = rerun_cleaned_card_frame.clone();
+                let cleanup_timing_label = cleanup_timing_label.clone();
+                let load_status = load_status.clone();
+                let audio_files_toggle = audio_files_toggle.clone();
+                let load_audio_button = load_audio_button.clone();
+                let source_path = path;
 
-                    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                        match rx.try_recv() {
-                            Ok(Ok(import)) => {
-                                load_audio_button.set_sensitive(true);
-                                let md_name = import
-                                    .markdown_path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("transcript.md");
-                                load_status.set_label(&format!(
-                                    "Saved {md_name} next to {}.",
-                                    display_file_name(&source_path)
-                                ));
+                glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                    match rx.try_recv() {
+                        Ok(Ok(import)) => {
+                            load_audio_button.set_sensitive(true);
+                            let md_name = import
+                                .markdown_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("transcript.md");
+                            load_status.set_label(&format!(
+                                "Saved {md_name} next to {}.",
+                                display_file_name(&source_path)
+                            ));
 
-                                // Prefer Audio files mode after a successful import.
-                                if !audio_files_toggle.is_active() {
-                                    // Grouped toggle: activating Audio files deactivates Recordings.
-                                    audio_files_toggle.set_active(true);
-                                }
-
-                                let refreshed = HistoryStore::open(state_root())
-                                    .and_then(|store| store.recent_runs())
-                                    .unwrap_or_default();
-                                {
-                                    let mut model = model.borrow_mut();
-                                    model.replace_all_runs(refreshed);
-                                    model.set_mode(HistoryListMode::AudioFiles);
-                                }
-                                rebuild_history_list_ui(
-                                    &model,
-                                    &list_box,
-                                    &metadata_line,
-                                    &transcription_subtitle,
-                                    &original_raw_label,
-                                    &cleanup_subtitle,
-                                    &original_cleaned_label,
-                                    &diarization_container,
-                                    &use_ocr_check,
-                                    &play_button,
-                                    &rerun_button,
-                                    &rerun_cleanup_button,
-                                    &rerun_raw_card_frame,
-                                    &rerun_cleaned_card_frame,
-                                    &cleanup_timing_label,
-                                );
-                                glib::ControlFlow::Break
+                            // Prefer Audio files mode after a successful import.
+                            if !audio_files_toggle.is_active() {
+                                // Grouped toggle: activating Audio files deactivates Recordings.
+                                audio_files_toggle.set_active(true);
                             }
-                            Ok(Err(error)) => {
-                                load_audio_button.set_sensitive(true);
-                                load_status.set_label(&format!("Import failed: {error}"));
-                                glib::ControlFlow::Break
+
+                            let refreshed = HistoryStore::open(state_root())
+                                .and_then(|store| store.recent_runs())
+                                .unwrap_or_default();
+                            {
+                                let mut model = model.borrow_mut();
+                                model.replace_all_runs(refreshed);
+                                model.set_mode(HistoryListMode::AudioFiles);
                             }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                glib::ControlFlow::Continue
-                            }
-                            Err(_) => {
-                                load_audio_button.set_sensitive(true);
-                                load_status.set_label("Import failed: worker channel closed.");
-                                glib::ControlFlow::Break
-                            }
+                            rebuild_history_list_ui(
+                                &model,
+                                &list_box,
+                                &metadata_line,
+                                &transcription_subtitle,
+                                &original_raw_label,
+                                &cleanup_subtitle,
+                                &original_cleaned_label,
+                                &diarization_container,
+                                &use_ocr_check,
+                                &play_button,
+                                &rerun_button,
+                                &rerun_cleanup_button,
+                                &rerun_raw_card_frame,
+                                &rerun_cleaned_card_frame,
+                                &cleanup_timing_label,
+                            );
+                            glib::ControlFlow::Break
                         }
-                    });
-                },
+                        Ok(Err(error)) => {
+                            load_audio_button.set_sensitive(true);
+                            load_status.set_label(&format!("Import failed: {error}"));
+                            glib::ControlFlow::Break
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                        Err(_) => {
+                            load_audio_button.set_sensitive(true);
+                            load_status.set_label("Import failed: worker channel closed.");
+                            glib::ControlFlow::Break
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    // =====================================================================
+    // Privacy purge: history + associated recording artifacts
+    // =====================================================================
+    {
+        let model = model.clone();
+        let list_box = list_box.clone();
+        let play_button = play_button.clone();
+        let rerun_button = rerun_button.clone();
+        let rerun_cleanup_button = rerun_cleanup_button.clone();
+        let load_status = load_status.clone();
+        let metadata_line = metadata_line.clone();
+        let transcription_subtitle = transcription_subtitle.clone();
+        let original_raw_label = original_raw_card.1.clone();
+        let cleanup_subtitle = cleanup_subtitle.clone();
+        let original_cleaned_label = original_cleaned_card.1.clone();
+        let diarization_container = diarization_container.clone();
+        let use_ocr_check = use_ocr_check.clone();
+        let rerun_raw_card_frame = rerun_raw_card.0.clone();
+        let rerun_cleaned_card_frame = rerun_cleaned_card.0.clone();
+        let cleanup_timing_label = cleanup_timing_label.clone();
+        purge_button.connect_clicked(move |button| {
+            let parent = button
+                .root()
+                .and_then(|root| root.downcast::<gtk::Window>().ok());
+            let dialog = adw::AlertDialog::new(
+                Some("Purge history?"),
+                Some(
+                    "Permanently deletes past dictation history for privacy:\n\
+                     • archived runs (transcripts, OCR, context, WAV)\n\
+                     • transcript log\n\
+                     • Pepper X live/test recordings (live-recording-*, test-dictation-*)\n\n\
+                     Keeps settings, models, and correction memory.\n\
+                     Other files in a user-managed recordings folder are left alone.\n\
+                     This cannot be undone.",
+                ),
             );
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("purge", "Purge");
+            dialog.set_response_appearance("purge", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+
+            let model = model.clone();
+            let list_box = list_box.clone();
+            let play_button = play_button.clone();
+            let rerun_button = rerun_button.clone();
+            let rerun_cleanup_button = rerun_cleanup_button.clone();
+            let load_status = load_status.clone();
+            let metadata_line = metadata_line.clone();
+            let transcription_subtitle = transcription_subtitle.clone();
+            let original_raw_label = original_raw_label.clone();
+            let cleanup_subtitle = cleanup_subtitle.clone();
+            let original_cleaned_label = original_cleaned_label.clone();
+            let diarization_container = diarization_container.clone();
+            let use_ocr_check = use_ocr_check.clone();
+            let rerun_raw_card_frame = rerun_raw_card_frame.clone();
+            let rerun_cleaned_card_frame = rerun_cleaned_card_frame.clone();
+            let cleanup_timing_label = cleanup_timing_label.clone();
+            dialog.connect_response(None, move |_, response| {
+                if response != "purge" {
+                    return;
+                }
+                match HistoryStore::open(state_root())
+                    .and_then(|store| store.purge_history_for_privacy())
+                {
+                    Ok(stats) => {
+                        load_status.set_label(&stats.summary_text());
+                        model.borrow_mut().clear_runs();
+                        while let Some(child) = list_box.first_child() {
+                            list_box.remove(&child);
+                        }
+                        metadata_line.set_label("");
+                        transcription_subtitle.set_label("");
+                        original_raw_label.set_label("No archived runs yet.");
+                        cleanup_subtitle.set_label("");
+                        original_cleaned_label.set_label("No cleanup transcript for this run.");
+                        clear_diarization_container(&diarization_container);
+                        use_ocr_check.set_visible(false);
+                        rerun_raw_card_frame.set_visible(false);
+                        rerun_cleaned_card_frame.set_visible(false);
+                        cleanup_timing_label.set_visible(false);
+                        play_button.set_sensitive(false);
+                        rerun_button.set_sensitive(false);
+                        rerun_cleanup_button.set_sensitive(false);
+                    }
+                    Err(error) => {
+                        load_status.set_label(&format!("Purge failed: {error}"));
+                    }
+                }
+            });
+
+            if let Some(parent) = parent.as_ref() {
+                dialog.present(Some(parent));
+            } else {
+                dialog.present(None::<&gtk::Window>);
+            }
         });
     }
 
@@ -1056,10 +1205,7 @@ fn rebuild_history_list_ui(
 }
 
 fn is_supported_audio_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("wav"))
-        .unwrap_or(false)
+    pepperx_asr::is_supported_audio_extension(path)
 }
 
 fn display_file_name(path: &Path) -> String {
@@ -1073,6 +1219,7 @@ fn display_file_name(path: &Path) -> String {
 // Populate detail widgets for a selected run
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // GTK widget wiring
 fn populate_detail_for_run(
     run: &ArchivedRun,
     metadata_line: &gtk::Label,
@@ -1151,10 +1298,12 @@ fn populate_detail_for_run(
 // Text-only detail output (used by selected_details_text for tests)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 pub(crate) fn history_run_details_text(run: &ArchivedRun) -> String {
     details_text_single(run)
 }
 
+#[cfg(test)]
 fn details_text_single(run: &ArchivedRun) -> String {
     let entry = &run.entry;
     let mut details = format!("Original Raw Transcript:\n{}", entry.transcript_text);
@@ -1170,6 +1319,7 @@ fn details_text_single(run: &ArchivedRun) -> String {
     details
 }
 
+#[cfg(test)]
 fn details_text_comparison(original_run: &ArchivedRun, rerun: &ArchivedRun) -> String {
     let original_cleaned_text = original_run
         .entry
@@ -1200,6 +1350,7 @@ fn details_text_comparison(original_run: &ArchivedRun, rerun: &ArchivedRun) -> S
     details
 }
 
+#[cfg(test)]
 fn build_metadata_lines(run: &ArchivedRun) -> Vec<String> {
     let entry = &run.entry;
     let mut lines = vec![
@@ -1279,6 +1430,7 @@ fn build_metadata_lines(run: &ArchivedRun) -> Vec<String> {
     lines
 }
 
+#[cfg(test)]
 fn comparison_metadata_lines(original_run: &ArchivedRun, rerun: &ArchivedRun) -> Vec<String> {
     let original_cleanup_model = original_run
         .entry
@@ -1502,9 +1654,7 @@ fn word_diff_markup(old_text: &str, new_text: &str) -> String {
             }
             DiffOp::Added(word) => {
                 let escaped = glib::markup_escape_text(word);
-                parts.push(format!(
-                    "<span foreground=\"#2ec27e\">{escaped}</span>"
-                ));
+                parts.push(format!("<span foreground=\"#2ec27e\">{escaped}</span>"));
             }
         }
     }
@@ -1522,11 +1672,15 @@ fn format_epoch_ms(epoch_ms: u64) -> String {
     const DAYS_IN_MONTH: &[u64] = &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
     fn is_leap_year(year: u64) -> bool {
-        (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
     }
 
     fn days_in_year(year: u64) -> u64 {
-        if is_leap_year(year) { 366 } else { 365 }
+        if is_leap_year(year) {
+            366
+        } else {
+            365
+        }
     }
 
     fn days_in_month(year: u64, month: usize) -> u64 {
@@ -1711,10 +1865,7 @@ pub(crate) fn build_diarization_timeline(
         } else {
             speaker.to_string()
         };
-        let label = gtk::Label::builder()
-            .label(&label_text)
-            .xalign(0.0)
-            .build();
+        let label = gtk::Label::builder().label(&label_text).xalign(0.0).build();
 
         let legend_item = gtk::Box::new(Orientation::Horizontal, 4);
         legend_item.append(&swatch);
@@ -1766,7 +1917,10 @@ fn history_row_title(run: &ArchivedRun) -> String {
 }
 
 fn history_row_subtitle(run: &ArchivedRun) -> String {
-    format!("{} \u{2022} {} ms", run.entry.model_name, run.entry.elapsed_ms)
+    format!(
+        "{} \u{2022} {} ms",
+        run.entry.model_name, run.entry.elapsed_ms
+    )
 }
 
 fn picker_label(text: &str) -> gtk::Label {
@@ -2002,9 +2156,9 @@ mod history_view_tests {
 
         assert!(details.contains("Original raw transcript:\nhello from pepper x"));
         assert!(details.contains("Rerun raw transcript:\nhello from pepper ex"));
-        assert!(details.contains(
-            "Cleanup model: qwen3.5-2b-q4_k_m.gguf -> qwen3.5-0.8b-q4_k_m.gguf"
-        ));
+        assert!(
+            details.contains("Cleanup model: qwen3.5-2b-q4_k_m.gguf -> qwen3.5-0.8b-q4_k_m.gguf")
+        );
         assert!(details.contains("Cleanup prompt profile: ordinary-dictation -> literal-dictation"));
     }
 
@@ -2144,6 +2298,39 @@ mod history_view_tests {
     }
 
     #[test]
+    fn history_view_cleanup_click_uses_callback_profile_and_error() {
+        let settings = crate::settings::AppSettings {
+            cleanup_prompt_profile: "literal-dictation".into(),
+            ..Default::default()
+        };
+        let callback: RerunCleanupFn = Arc::new(move |run_id, cleanup_model_id, custom_prompt| {
+            let request = crate::app::cleanup_rerun_request_from_settings(
+                &settings,
+                run_id,
+                cleanup_model_id,
+                custom_prompt,
+            );
+            assert_eq!(
+                request.cleanup_prompt_profile.as_deref(),
+                Some("literal-dictation")
+            );
+            assert_eq!(
+                request.custom_prompt_text.as_deref(),
+                Some("keep my wording")
+            );
+            crate::app::cleanup_rerun_entry_or_log(Err::<TranscriptEntry, &str>("cleanup failed"))
+        });
+
+        let entry = invoke_cleanup_rerun(
+            &callback,
+            "run-1".into(),
+            "qwen".into(),
+            Some("keep my wording".into()),
+        );
+        assert!(entry.is_none());
+    }
+
+    #[test]
     fn history_view_selected_wav_path_returns_none_when_file_does_not_exist() {
         let run = archived_run(
             "run-1",
@@ -2228,10 +2415,15 @@ mod history_view_tests {
     }
 
     #[test]
-    fn is_supported_audio_path_accepts_wav_only() {
+    fn is_supported_audio_path_accepts_common_formats() {
         assert!(is_supported_audio_path(Path::new("/tmp/note.wav")));
         assert!(is_supported_audio_path(Path::new("/tmp/NOTE.WAV")));
-        assert!(!is_supported_audio_path(Path::new("/tmp/note.mp3")));
+        assert!(is_supported_audio_path(Path::new("/tmp/note.mp3")));
+        assert!(is_supported_audio_path(Path::new("/tmp/note.flac")));
+        assert!(is_supported_audio_path(Path::new("/tmp/note.ogg")));
+        assert!(is_supported_audio_path(Path::new("/tmp/note.m4a")));
+        assert!(is_supported_audio_path(Path::new("/tmp/note.aac")));
+        assert!(!is_supported_audio_path(Path::new("/tmp/note.txt")));
         assert!(!is_supported_audio_path(Path::new("/tmp/note")));
     }
 
@@ -2266,7 +2458,7 @@ mod history_view_tests {
     #[test]
     fn format_epoch_ms_renders_readable_date() {
         // 2026-01-01 00:00:00 UTC = 1767225600 seconds
-        let formatted = format_epoch_ms(1767225600_000);
+        let formatted = format_epoch_ms(1_767_225_600_000);
         assert!(formatted.contains("Jan"));
         assert!(formatted.contains("2026"));
     }

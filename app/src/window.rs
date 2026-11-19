@@ -9,13 +9,14 @@ use crate::app_model::{RuntimeReadinessSummary, SettingsSurfaceState};
 use crate::history_view::build_history_browser;
 use crate::overlay::OverlayView;
 use crate::settings_view::SettingsView;
-use crate::transcript_log::TranscriptEntry;
 use pepperx_models::{ModelInventoryEntry, ModelKind};
 
 use crate::history_store::ArchivedRun;
+use crate::history_view::{RerunArchivedRunFn, RerunCleanupFn};
 use crate::settings::AppSettings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum PageScaffoldKind {
     Form,
 }
@@ -23,11 +24,13 @@ enum PageScaffoldKind {
 /// All content now lives inside the SettingsView sidebar. These variants
 /// exist for test-level introspection of the window's logical sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum WindowPage {
     Settings,
     History,
 }
 
+#[cfg(test)]
 impl WindowPage {
     fn container_kind(self) -> PageScaffoldKind {
         match self {
@@ -53,8 +56,8 @@ struct WindowContentSnapshot {
 pub struct MainWindow {
     app: adw::Application,
     content_providers: Rc<WindowContentProviders>,
-    rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
-    rerun_cleanup: Option<Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>>,
+    rerun_archived_run: Option<RerunArchivedRunFn>,
+    rerun_cleanup: Option<RerunCleanupFn>,
     play_audio: Option<Rc<dyn Fn(PathBuf)>>,
     live_status: Rc<RefCell<LiveStatus>>,
     state: Rc<RefCell<Option<WindowState>>>,
@@ -88,6 +91,7 @@ impl MainWindow {
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_history_and_settings(
         app: &adw::Application,
         history_runs: Vec<ArchivedRun>,
@@ -147,8 +151,8 @@ impl MainWindow {
         history_runs: H,
         settings_surface_state: S,
         diagnostics_summary: D,
-        rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
-        rerun_cleanup: Option<Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>>,
+        rerun_archived_run: Option<RerunArchivedRunFn>,
+        rerun_cleanup: Option<RerunCleanupFn>,
         play_audio: Option<Rc<dyn Fn(PathBuf)>>,
     ) -> Self
     where
@@ -292,6 +296,7 @@ impl MainWindow {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn settings_summary_text(
     settings: &AppSettings,
     cache_root: &Path,
@@ -348,7 +353,10 @@ pub(crate) fn diagnostics_summary_text(
             "Modifier-only capture supported: {}",
             readiness.modifier_capture_supported
         ),
-        format!("Extension connected: {}", readiness.extension_connected.get()),
+        format!(
+            "Extension connected: {}",
+            readiness.extension_connected.get()
+        ),
         format!("Service version: {}", readiness.service_version),
     ];
 
@@ -396,6 +404,7 @@ pub(crate) fn diagnostics_summary_text(
     lines.join("\n")
 }
 
+#[cfg(test)]
 pub(crate) fn history_summary_text(runs: &[ArchivedRun]) -> String {
     if let Some(latest) = runs.first() {
         let entry = &latest.entry;
@@ -485,8 +494,8 @@ fn default_diagnostics_summary() -> String {
 fn replace_history_browser(
     container: &gtk::Box,
     runs: &[ArchivedRun],
-    rerun_archived_run: Option<Rc<dyn Fn(String, String) -> Option<TranscriptEntry>>>,
-    rerun_cleanup: Option<Rc<dyn Fn(String, String, Option<String>) -> Option<TranscriptEntry>>>,
+    rerun_archived_run: Option<RerunArchivedRunFn>,
+    rerun_cleanup: Option<RerunCleanupFn>,
     play_audio: Option<Rc<dyn Fn(PathBuf)>>,
 ) {
     while let Some(child) = container.first_child() {
@@ -573,9 +582,8 @@ mod app_shell {
         assert!(summary.contains("Default cleanup model: qwen3.5-2b-q4_k_m.gguf"));
         assert!(summary.contains("Cleanup prompt profile: ordinary-dictation"));
         assert!(summary.contains("ASR model nemo-parakeet-tdt-0.6b-v3-int8: ready"));
-        assert!(summary.contains(
-            "Cleanup model qwen3.5-2b-q4_k_m.gguf: missing qwen3.5-2b-q4_k_m.gguf"
-        ));
+        assert!(summary
+            .contains("Cleanup model qwen3.5-2b-q4_k_m.gguf: missing qwen3.5-2b-q4_k_m.gguf"));
     }
 
     #[test]
@@ -614,7 +622,7 @@ mod app_shell {
             &RuntimeReadinessSummary {
                 modifier_capture_supported: true,
                 extension_connected: std::cell::Cell::new(false),
-                service_version: "0.1.0".into(),
+                service_version: "1.0.0".into(),
             },
         );
 
@@ -660,7 +668,7 @@ mod app_shell {
             &cache_root,
             &[],
             Some(&archived_run(entry)),
-            &RuntimeReadinessSummary::from_capabilities(&Capabilities::shell_default("0.1.0")),
+            &RuntimeReadinessSummary::from_capabilities(&Capabilities::shell_default("1.0.0")),
         );
 
         assert!(summary.contains("Latest run ID: run-1"));
@@ -683,6 +691,7 @@ mod app_shell {
             cleanup_gpu_layers: 0,
             preferred_asr_model: "nemo-parakeet-tdt-0.6b-v3-int8".into(),
             preferred_cleanup_model: "qwen3.5-2b-q4_k_m.gguf".into(),
+            preferred_asr_language: "fr-FR".into(),
             cleanup_prompt_profile: "ordinary-dictation".into(),
             cleanup_custom_prompt: String::from("settings v1"),
             launch_at_login: false,
@@ -735,6 +744,7 @@ mod app_shell {
             cleanup_gpu_layers: 0,
             preferred_asr_model: "nemo-parakeet-tdt-0.6b-v3-int8".into(),
             preferred_cleanup_model: "qwen3.5-2b-q4_k_m.gguf".into(),
+            preferred_asr_language: "en-US".into(),
             cleanup_prompt_profile: "literal-dictation".into(),
             cleanup_custom_prompt: String::from("settings v2"),
             launch_at_login: true,
@@ -770,10 +780,7 @@ mod app_shell {
             WindowPage::Settings.container_kind(),
             PageScaffoldKind::Form
         );
-        assert_eq!(
-            WindowPage::History.container_kind(),
-            PageScaffoldKind::Form
-        );
+        assert_eq!(WindowPage::History.container_kind(), PageScaffoldKind::Form);
     }
 
     #[test]
@@ -784,6 +791,7 @@ mod app_shell {
             cleanup_gpu_layers: 0,
             preferred_asr_model: "nemo-parakeet-tdt-0.6b-v3-int8".into(),
             preferred_cleanup_model: "qwen3.5-2b-q4_k_m.gguf".into(),
+            preferred_asr_language: "fr-FR".into(),
             cleanup_prompt_profile: "ordinary-dictation".into(),
             cleanup_custom_prompt: "Keep Linux app names verbatim.".into(),
             launch_at_login: true,
@@ -793,7 +801,9 @@ mod app_shell {
             toggle_trigger_keys: "56,57,100,125,126".into(),
             ignore_other_speakers: false,
             enable_post_paste_learning: true,
-            correction_memory_text: Some("Preferred transcript examples:\n- raw: hello\n  preferred: Hello".into()),
+            correction_memory_text: Some(
+                "Preferred transcript examples:\n- raw: hello\n  preferred: Hello".into(),
+            ),
             preferred_transcriptions_text: "Hello".into(),
             replacement_rules_text: String::new(),
             feedback_message: Some("Saved settings".into()),
@@ -936,6 +946,15 @@ mod app_shell {
             &scaffold.sections[3].controls[1],
             SettingsControl::Select(SettingsSelectControl {
                 title,
+                selected,
+                enabled: false,
+                ..
+            }) if title == "Transcription language" && selected == "fr-FR"
+        ));
+        assert!(matches!(
+            &scaffold.sections[3].controls[2],
+            SettingsControl::Select(SettingsSelectControl {
+                title,
                 ..
             }) if title == "Cleanup model"
         ));
@@ -960,7 +979,7 @@ mod app_shell {
     #[test]
     fn window_diagnostics_page_scaffold_builds_card_entries() {
         let scaffold = diagnostics_page_scaffold(
-            "Modifier-only capture supported: true\nExtension connected: false\nService version: 0.1.0",
+            "Modifier-only capture supported: true\nExtension connected: false\nService version: 1.0.0",
         );
 
         assert_eq!(scaffold.container_kind, DiagnosticsContainerKind::CardList);

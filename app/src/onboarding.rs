@@ -168,7 +168,7 @@ impl OnboardingWizard {
                     model_bootstrap.progress_label,
                 );
                 if let Some(failure_message) = model_bootstrap.failure_message.as_deref() {
-                    body.push_str("\n");
+                    body.push('\n');
                     body.push_str(failure_message);
                 }
                 if let Some(recovery_body) = step_recovery_body(checklist, readiness) {
@@ -362,7 +362,7 @@ pub fn show_onboarding_window(
             ));
         })
     };
-    ensure_default_model_bootstrap(&app_model, refresh_ui.clone());
+    ensure_default_model_bootstrap(app_model, refresh_ui.clone());
     refresh_ui();
 
     primary_button.connect_clicked({
@@ -476,7 +476,7 @@ mod tests {
         RuntimeReadinessSummary {
             modifier_capture_supported: true,
             extension_connected: std::cell::Cell::new(true),
-            service_version: "0.1.0".into(),
+            service_version: "1.0.0".into(),
         }
     }
 

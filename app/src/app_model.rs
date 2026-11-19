@@ -36,6 +36,7 @@ pub struct SettingsSurfaceState {
     pub cleanup_gpu_layers: u32,
     pub preferred_asr_model: String,
     pub preferred_cleanup_model: String,
+    pub preferred_asr_language: String,
     pub cleanup_prompt_profile: String,
     pub cleanup_custom_prompt: String,
     pub launch_at_login: bool,
@@ -112,6 +113,7 @@ impl AppModel {
         self.setup_state.borrow().clone()
     }
 
+    #[cfg(test)]
     pub fn setup_title(&self) -> &'static str {
         match self.setup_state() {
             SetupState::SetupRequired => "Finish Pepper X setup",
@@ -120,6 +122,7 @@ impl AppModel {
         }
     }
 
+    #[cfg(test)]
     pub fn setup_description(&self) -> String {
         match self.setup_state() {
             SetupState::SetupRequired => {
@@ -191,6 +194,7 @@ impl RuntimeReadinessSummary {
 }
 
 impl SetupChecklist {
+    #[cfg(test)]
     pub fn new(trigger_ready: bool) -> Self {
         Self {
             trigger_ready,
@@ -221,6 +225,7 @@ impl SetupChecklist {
 }
 
 impl ModelBootstrapSummary {
+    #[cfg(test)]
     pub fn ready() -> Self {
         Self {
             asr_ready: true,
@@ -308,6 +313,7 @@ impl SettingsSurfaceState {
             cleanup_gpu_layers: settings.cleanup_gpu_layers,
             preferred_asr_model: settings.preferred_asr_model.clone(),
             preferred_cleanup_model: settings.preferred_cleanup_model.clone(),
+            preferred_asr_language: settings.preferred_asr_language.clone(),
             cleanup_prompt_profile: settings.cleanup_prompt_profile.clone(),
             cleanup_custom_prompt: settings.cleanup_custom_prompt.clone(),
             launch_at_login: settings.launch_at_login,

@@ -14,6 +14,7 @@ const SETTINGS_FILE_NAME: &str = "settings.json";
 const SETUP_STATE_FILE_NAME: &str = "setup.json";
 pub const DEFAULT_CLEANUP_PROMPT_PROFILE: &str = "ordinary-dictation";
 pub const LAUNCH_AT_LOGIN_DESKTOP_FILE_NAME: &str = "pepper-x-autostart.desktop";
+#[cfg(test)]
 pub const LAUNCH_AT_LOGIN_DESKTOP_FILE_PATH: &str = "/etc/xdg/autostart/pepper-x-autostart.desktop";
 const LAUNCH_AT_LOGIN_DESKTOP_TEMPLATE: &str =
     include_str!("../../packaging/deb/pepper-x-autostart.desktop");
@@ -38,6 +39,64 @@ fn default_toggle_trigger_keys() -> String {
     "56,57,100,125,126".into()
 }
 
+fn default_preferred_asr_language() -> String {
+    "fr-FR".into()
+}
+
+/// Languages exposed in Settings when a multilingual Nemotron model is selected.
+/// Codes match parakeet-rs / Nemotron 3.5 `set_target_lang` (see PROMPT_DICTIONARY).
+pub const ASR_LANGUAGE_OPTIONS: &[(&str, &str)] = &[
+    ("auto", "Auto-detect"),
+    ("fr-FR", "French (France)"),
+    ("fr-CA", "French (Canada)"),
+    ("en-US", "English (US)"),
+    ("en-GB", "English (UK)"),
+    ("es-ES", "Spanish (Spain)"),
+    ("es-US", "Spanish (US)"),
+    ("de-DE", "German"),
+    ("it-IT", "Italian"),
+    ("pt-BR", "Portuguese (Brazil)"),
+    ("pt-PT", "Portuguese (Portugal)"),
+    ("nl-NL", "Dutch"),
+    ("pl-PL", "Polish"),
+    ("cs-CZ", "Czech"),
+    ("ru-RU", "Russian"),
+    ("uk-UA", "Ukrainian"),
+    ("tr-TR", "Turkish"),
+    ("ar-AR", "Arabic"),
+    ("he-IL", "Hebrew"),
+    ("hi-IN", "Hindi"),
+    ("ja-JP", "Japanese"),
+    ("ko-KR", "Korean"),
+    ("zh-CN", "Chinese (Simplified)"),
+    ("zh-TW", "Chinese (Traditional)"),
+    ("vi-VN", "Vietnamese"),
+    ("th-TH", "Thai"),
+    ("id-ID", "Indonesian"),
+    ("sv-SE", "Swedish"),
+    ("da-DK", "Danish"),
+    ("nb-NO", "Norwegian"),
+    ("fi-FI", "Finnish"),
+    ("el-GR", "Greek"),
+    ("ro-RO", "Romanian"),
+    ("hu-HU", "Hungarian"),
+    ("sk-SK", "Slovak"),
+];
+
+/// True when the ASR model accepts Nemotron `target_lang` selection.
+pub fn asr_model_is_multilingual(model_id: &str) -> bool {
+    model_id.contains("nemotron-3.5")
+}
+
+/// Resolve a stored language code to a known option (fallback `fr-FR`).
+pub fn resolve_asr_language(code: &str) -> &'static str {
+    ASR_LANGUAGE_OPTIONS
+        .iter()
+        .find(|(id, _)| *id == code)
+        .map(|(id, _)| *id)
+        .unwrap_or("fr-FR")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RecordingTriggerMode {
@@ -54,6 +113,10 @@ pub struct AppSettings {
     pub cleanup_enabled: bool,
     pub preferred_asr_model: String,
     pub preferred_cleanup_model: String,
+    /// Target language for multilingual Nemotron ASR (`fr-FR`, `en-US`, `auto`, …).
+    /// Ignored for English-only models.
+    #[serde(default = "default_preferred_asr_language")]
+    pub preferred_asr_language: String,
     pub cleanup_prompt_profile: String,
     pub cleanup_custom_prompt: String,
     #[serde(default = "default_play_sounds")]
@@ -107,6 +170,7 @@ impl Default for AppSettings {
             cleanup_enabled: true,
             preferred_asr_model: default_model(ModelKind::Asr).id.into(),
             preferred_cleanup_model: default_model(ModelKind::Cleanup).id.into(),
+            preferred_asr_language: default_preferred_asr_language(),
             cleanup_prompt_profile: DEFAULT_CLEANUP_PROMPT_PROFILE.into(),
             cleanup_custom_prompt: String::new(),
             play_sounds: true,
@@ -253,6 +317,7 @@ pub fn corrections_store_path() -> PathBuf {
     state_root().join("corrections")
 }
 
+#[cfg(test)]
 pub fn launch_at_login_desktop_file_path() -> &'static std::path::Path {
     std::path::Path::new(LAUNCH_AT_LOGIN_DESKTOP_FILE_PATH)
 }
@@ -470,6 +535,7 @@ mod tests {
                 "cleanup_enabled": true,
                 "preferred_asr_model": "nemo-parakeet-tdt-0.6b-v3-int8",
                 "preferred_cleanup_model": "qwen3.5-2b-q4_k_m.gguf",
+                "preferred_asr_language": "fr-FR",
                 "cleanup_prompt_profile": "ordinary-dictation",
                 "cleanup_custom_prompt": "",
                 "play_sounds": true,
@@ -483,6 +549,7 @@ mod tests {
             })
         );
         assert_eq!(restored.preferred_asr_model, settings.preferred_asr_model);
+        assert_eq!(restored.preferred_asr_language, "fr-FR");
         assert_eq!(
             restored.preferred_cleanup_model,
             settings.preferred_cleanup_model
@@ -523,6 +590,7 @@ mod tests {
                 "cleanup_enabled": true,
                 "preferred_asr_model": "nemotron-3.5-asr-streaming-0.6b-int8",
                 "preferred_cleanup_model": "qwen3.5-2b-q4_k_m.gguf",
+                "preferred_asr_language": "fr-FR",
                 "cleanup_prompt_profile": "ordinary-dictation",
                 "cleanup_custom_prompt": "",
                 "play_sounds": true,
@@ -560,6 +628,7 @@ mod tests {
                 "cleanup_enabled": false,
                 "preferred_asr_model": "nemotron-3.5-asr-streaming-0.6b-int8",
                 "preferred_cleanup_model": "qwen3.5-2b-q4_k_m.gguf",
+                "preferred_asr_language": "fr-FR",
                 "cleanup_prompt_profile": "literal-dictation",
                 "cleanup_custom_prompt": "Keep product names verbatim.",
                 "play_sounds": true,
@@ -579,6 +648,18 @@ mod tests {
             restored.cleanup_custom_prompt,
             "Keep product names verbatim."
         );
+    }
+
+    #[test]
+    fn asr_language_helpers_resolve_known_codes_and_multilingual_models() {
+        assert!(asr_model_is_multilingual("nemotron-3.5-asr-streaming-0.6b-int8"));
+        assert!(asr_model_is_multilingual("nemotron-3.5-asr-streaming-0.6b-int4"));
+        assert!(!asr_model_is_multilingual("nemotron-speech-streaming-en-0.6b"));
+        assert!(!asr_model_is_multilingual("nemo-parakeet-tdt-0.6b-v3-int8"));
+
+        assert_eq!(resolve_asr_language("en-US"), "en-US");
+        assert_eq!(resolve_asr_language("auto"), "auto");
+        assert_eq!(resolve_asr_language("not-a-lang"), "fr-FR");
     }
 
     #[test]

@@ -1,0 +1,21 @@
+#!/bin/bash
+# llama-cpp-sys-4 passes -j$(nproc). Replace it. nvcc threads stay in the nvcc wrapper.
+jobs=${PEPPERX_CMAKE_JOBS:-4}
+args=()
+while [ $# -gt 0 ]; do
+  a=$1
+  shift
+  case "$a" in
+    -j)
+      args+=("-j${jobs}")
+      if [[ ${1-} =~ ^[0-9]+$ ]]; then shift; fi
+      ;;
+    -j*)
+      args+=("-j${jobs}")
+      ;;
+    *)
+      args+=("$a")
+      ;;
+  esac
+done
+exec /usr/bin/ninja "${args[@]}"

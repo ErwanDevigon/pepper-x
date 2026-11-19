@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use pepperx_audio::recording::{
     start_recording, start_recording_with_chunk_sink, ActiveRecording, ChunkSink,
@@ -6,9 +6,9 @@ use pepperx_audio::recording::{
 };
 use pepperx_audio::SelectedMicrophone;
 use pepperx_ipc::{LiveStatus, SharedLiveStatus};
+use pepperx_platform_gnome::context::SupportingContext;
 use pepperx_platform_gnome::service::{RecordingRuntime, RecordingRuntimeError};
 use pepperx_session::{RecordingSession, SessionError, SessionState, TriggerSource};
-use pepperx_platform_gnome::context::SupportingContext;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,19 +34,19 @@ struct StreamingHandle {
 }
 
 /// Spawn a background thread that creates a [`pepperx_asr::StreamingTranscriber`],
-/// reads audio chunks from `chunk_rx`, and feeds them in real-time.  When the
-/// channel is closed (sender dropped), the thread flushes remaining audio and
-/// sends the final transcript through `result_tx`.
+/// reads audio chunks from `chunk_rx`, and feeds them in real-time.
 fn spawn_streaming_transcriber(
     model_dir: std::path::PathBuf,
     model_name: String,
+    target_lang: Option<String>,
 ) -> Option<StreamingHandle> {
     let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<Vec<f32>>();
     let (result_tx, result_rx) = std::sync::mpsc::channel::<Option<StreamingTranscript>>();
 
     let builder = std::thread::Builder::new().name("pepperx-streaming-asr".into());
     match builder.spawn(move || {
-        let mut transcriber = match pepperx_asr::StreamingTranscriber::new(&model_dir) {
+        let mut transcriber = match pepperx_asr::StreamingTranscriber::new(&model_dir, target_lang)
+        {
             Ok(t) => t,
             Err(error) => {
                 eprintln!(
@@ -68,13 +68,13 @@ fn spawn_streaming_transcriber(
             }
         }
 
-        // Channel closed — recording stopped.  Flush remaining samples.
+        // Channel closed — recording stopped. Flush remaining samples.
         match transcriber.flush() {
             Ok(transcript_text) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
-                eprintln!(
-                    "[Pepper X] streaming ASR complete in {elapsed_ms} ms"
-                );
+                if crate::transcription::verbose_logging() {
+                    eprintln!("[Pepper X] streaming ASR complete in {elapsed_ms} ms");
+                }
                 let _ = result_tx.send(Some(StreamingTranscript {
                     transcript_text,
                     model_name,
@@ -155,8 +155,7 @@ impl Recorder for PipeWireRecorder {
             "PipeWireRecorder should only start one active recording at a time"
         );
 
-        self.active_recording =
-            Some(start_recording_with_chunk_sink(request, Some(chunk_sink))?);
+        self.active_recording = Some(start_recording_with_chunk_sink(request, Some(chunk_sink))?);
         Ok(())
     }
 
@@ -174,6 +173,19 @@ type LivePipelineTranscriber =
     Box<dyn FnMut(LivePipelineRequest) -> Result<TranscriptEntry, TranscriptionRunError> + Send>;
 type LiveSessionRuntime =
     SessionRuntime<PipeWireRecorder, fn() -> PathBuf, LivePipelineTranscriber>;
+
+static PUBLISHED_LIVE_RUNTIME: std::sync::OnceLock<std::sync::Arc<LiveRuntimeHandle>> =
+    std::sync::OnceLock::new();
+
+pub fn publish_live_runtime(runtime: std::sync::Arc<LiveRuntimeHandle>) {
+    let _ = PUBLISHED_LIVE_RUNTIME.set(runtime);
+}
+
+pub fn apply_play_sounds(enabled: bool) {
+    if let Some(runtime) = PUBLISHED_LIVE_RUNTIME.get() {
+        runtime.set_play_sounds(enabled);
+    }
+}
 
 pub struct LiveRuntimeHandle {
     runtime: Mutex<LiveSessionRuntime>,
@@ -211,7 +223,6 @@ impl LiveRuntimeHandle {
         self.play_sounds.store(enabled, Ordering::Relaxed);
     }
 
-
     pub fn start_recording(
         &self,
         trigger_source: TriggerSource,
@@ -225,11 +236,7 @@ impl LiveRuntimeHandle {
             .runtime
             .lock()
             .expect("live runtime lock poisoned")
-            .start_recording_streaming(
-                trigger_source,
-                self.selected_microphone.clone(),
-                chunk_sink,
-            )
+            .start_recording_streaming(trigger_source, self.selected_microphone.clone(), chunk_sink)
             .map(|_| ());
 
         match &result {
@@ -274,7 +281,16 @@ impl LiveRuntimeHandle {
         let model_dir = crate::transcript_log::nonempty_env_path("PEPPERX_PARAKEET_MODEL_DIR")
             .unwrap_or(readiness.install_path);
 
-        spawn_streaming_transcriber(model_dir, model_id.to_string())
+        let target_lang = if crate::settings::asr_model_is_multilingual(model_id) {
+            let lang = crate::settings::resolve_asr_language(&settings.preferred_asr_language)
+                .to_string();
+            eprintln!("[Pepper X] multilingual ASR target language: {lang}");
+            Some(lang)
+        } else {
+            None
+        };
+
+        spawn_streaming_transcriber(model_dir, model_id.to_string(), target_lang)
     }
 
     fn start_context_prefetch_if_enabled(&self) {
@@ -300,9 +316,7 @@ impl LiveRuntimeHandle {
                 let _ = sender.send(context);
             })
         {
-            eprintln!(
-                "[Pepper X] failed to spawn context prefetch thread: {error}"
-            );
+            eprintln!("[Pepper X] failed to spawn context prefetch thread: {error}");
             *self
                 .context_prefetch
                 .lock()
@@ -362,10 +376,7 @@ impl LiveRuntimeHandle {
             .lock()
             .expect("context prefetch lock poisoned")
             .take()?;
-        match receiver.recv() {
-            Ok(context) => Some(context),
-            Err(_) => None,
-        }
+        receiver.recv().ok()
     }
 
     pub fn record_and_transcribe<F>(
@@ -653,9 +664,10 @@ where
 }
 
 #[cfg(test)]
-mod session_runtime {
+mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::path::Path;
     use std::rc::Rc;
     use std::time::Duration;
 

@@ -10,6 +10,15 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use xkbcommon::xkb;
 
+/// Informational (non-error) logging is opt-in: set `PEPPERX_VERBOSE=1` to
+/// print progress/timing messages. Errors are always printed.
+fn verbose_logging() -> bool {
+    static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERBOSE.get_or_init(|| {
+        std::env::var_os("PEPPERX_VERBOSE").is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
 const SOCKET_ENV: &str = "PEPPERX_UINPUT_HELPER_SOCKET";
 const STARTUP_DELAY: Duration = Duration::from_millis(250);
 const KEY_HOLD_DELAY: Duration = Duration::from_millis(2);
@@ -155,10 +164,12 @@ impl LayoutSession {
     fn open() -> Result<Self, String> {
         let (id, source) = resolve_active_layout();
         let mapper = build_char_mapper(&id.layout, &id.variant)?;
-        eprintln!(
-            "[Pepper X uinput] active layout '{}' (source={source})",
-            id.display()
-        );
+        if verbose_logging() {
+            eprintln!(
+                        "[Pepper X uinput] active layout '{}' (source={source})",
+                        id.display()
+                    );
+        }
         Ok(Self { id, mapper, source })
     }
 
@@ -168,11 +179,13 @@ impl LayoutSession {
         if id == self.id {
             return Ok(());
         }
-        eprintln!(
-            "[Pepper X uinput] layout switched '{}' → '{}' (source={source})",
-            self.id.display(),
-            id.display()
-        );
+        if verbose_logging() {
+            eprintln!(
+                        "[Pepper X uinput] layout switched '{}' → '{}' (source={source})",
+                        self.id.display(),
+                        id.display()
+                    );
+        }
         let mapper = build_char_mapper(&id.layout, &id.variant)?;
         self.id = id;
         self.mapper = mapper;
@@ -216,10 +229,12 @@ fn detect_gnome_active_layout() -> Option<LayoutId> {
     if let Some(raw) = gsettings_get("org.gnome.desktop.input-sources", "mru-sources") {
         let entries = parse_gsettings_input_sources(&raw);
         if let Some(id) = first_xkb_entry(&entries) {
-            eprintln!(
-                "[Pepper X uinput] detected active layout from mru-sources: {}",
-                id.display()
-            );
+            if verbose_logging() {
+                eprintln!(
+                                "[Pepper X uinput] detected active layout from mru-sources: {}",
+                                id.display()
+                            );
+            }
             return Some(id);
         }
     }
@@ -250,10 +265,12 @@ fn detect_gnome_active_layout() -> Option<LayoutId> {
 
     let (layout, variant) = split_layout_variant(&chosen.1, "");
     let id = LayoutId::new(layout, variant);
-    eprintln!(
-        "[Pepper X uinput] detected active layout from sources[{index}]: {}",
-        id.display()
-    );
+    if verbose_logging() {
+        eprintln!(
+                "[Pepper X uinput] detected active layout from sources[{index}]: {}",
+                id.display()
+            );
+    }
     Some(id)
 }
 
@@ -372,10 +389,12 @@ fn detect_setxkbmap_layout() -> Option<LayoutId> {
         .filter(|v| !v.is_empty())
         .unwrap_or("");
     let id = LayoutId::new(layout, variant);
-    eprintln!(
-        "[Pepper X uinput] detected layout from setxkbmap: {}",
-        id.display()
-    );
+    if verbose_logging() {
+        eprintln!(
+            "[Pepper X uinput] detected layout from setxkbmap: {}",
+            id.display()
+        );
+    }
     Some(id)
 }
 
@@ -402,10 +421,12 @@ fn detect_etc_default_keyboard() -> Option<LayoutId> {
         .filter(|v| !v.is_empty())
         .unwrap_or("");
     let id = LayoutId::new(layout, variant);
-    eprintln!(
-        "[Pepper X uinput] detected layout from /etc/default/keyboard: {}",
-        id.display()
-    );
+    if verbose_logging() {
+        eprintln!(
+            "[Pepper X uinput] detected layout from /etc/default/keyboard: {}",
+            id.display()
+        );
+    }
     Some(id)
 }
 
@@ -529,12 +550,14 @@ fn build_char_mapper(layout: &str, variant: &str) -> Result<CharMapper, String> 
 
     let hex_digits = build_hex_digit_map(&map);
 
-    eprintln!(
-        "[Pepper X uinput] XKB layout '{layout}' variant '{variant}' loaded, {} characters mapped ({} dead-key combos, {} hex digits)",
-        map.len(),
-        compose_added,
-        hex_digits.len()
-    );
+    if verbose_logging() {
+        eprintln!(
+            "[Pepper X uinput] XKB layout '{layout}' variant '{variant}' loaded, {} characters mapped ({} dead-key combos, {} hex digits)",
+            map.len(),
+            compose_added,
+            hex_digits.len()
+        );
+    }
 
     Ok(CharMapper { map, hex_digits })
 }
@@ -832,11 +855,13 @@ fn type_text(device: &mut VirtualDevice, text: &str, mapper: &CharMapper) -> Res
             .count();
         match try_paste_via_clipboard(device, text) {
             Ok(()) => {
-                eprintln!(
-                    "[Pepper X uinput] pasted {} chars via clipboard ({} not on active layout)",
-                    strokes.len(),
-                    unmapped
-                );
+                if verbose_logging() {
+                    eprintln!(
+                                        "[Pepper X uinput] pasted {} chars via clipboard ({} not on active layout)",
+                                        strokes.len(),
+                                        unmapped
+                                    );
+                }
                 return Ok(());
             }
             Err(error) => {
@@ -866,10 +891,12 @@ fn type_text(device: &mut VirtualDevice, text: &str, mapper: &CharMapper) -> Res
             }
             CharStroke::UnicodeHex(cp) => {
                 unicode_fallbacks += 1;
-                eprintln!(
-                    "[Pepper X uinput] unicode hex fallback for {:?} (U+{cp:04X})",
-                    ch
-                );
+                if verbose_logging() {
+                    eprintln!(
+                                        "[Pepper X uinput] unicode hex fallback for {:?} (U+{cp:04X})",
+                                        ch
+                                    );
+                }
                 emit_unicode_hex(device, *cp, mapper)?;
                 // Hex entry is easy to leave half-open; force modifiers up before next char.
                 release_all_modifiers(device)?;
@@ -881,11 +908,13 @@ fn type_text(device: &mut VirtualDevice, text: &str, mapper: &CharMapper) -> Res
     release_all_modifiers(device)?;
 
     if unicode_fallbacks > 0 {
-        eprintln!(
-            "[Pepper X uinput] typed {} chars ({} via unicode hex)",
-            strokes.len(),
-            unicode_fallbacks
-        );
+        if verbose_logging() {
+            eprintln!(
+                        "[Pepper X uinput] typed {} chars ({} via unicode hex)",
+                        strokes.len(),
+                        unicode_fallbacks
+                    );
+        }
     }
 
     Ok(())

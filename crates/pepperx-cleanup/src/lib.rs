@@ -94,6 +94,7 @@ mod cleanup_runtime {
         });
 
         assert!(prompt.contains("<USER-INPUT>\nhello from pepper x\n</USER-INPUT>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
 
     #[test]
@@ -167,7 +168,8 @@ mod cleanup_runtime {
 
         assert!(prompt.contains("<OCR-RULES>"));
         assert!(prompt.contains("</OCR-RULES>"));
-        assert!(prompt.contains("<WINDOW-OCR-CONTENT>\nTerminal: ~/git/pepper-x\n</WINDOW-OCR-CONTENT>"));
+        assert!(prompt
+            .contains("<WINDOW-OCR-CONTENT>\nTerminal: ~/git/pepper-x\n</WINDOW-OCR-CONTENT>"));
     }
 
     #[test]
@@ -204,7 +206,9 @@ mod cleanup_runtime {
             cleanup_gpu_layers: 0,
         });
 
-        assert!(prompt.contains("<WINDOW-OCR-CONTENT>\nline before\nline after\n</WINDOW-OCR-CONTENT>"));
+        assert!(
+            prompt.contains("<WINDOW-OCR-CONTENT>\nline before\nline after\n</WINDOW-OCR-CONTENT>")
+        );
         assert!(prompt.contains("<OCR-RULES>"));
     }
 
@@ -215,9 +219,7 @@ mod cleanup_runtime {
             model_path: PathBuf::from("/tmp/pepper-x-present.gguf"),
             supporting_context_text: None,
             ocr_text: None,
-            correction_memory_text: Some(
-                "- pepper x -> Pepper X\n- chat gbt -> ChatGPT".into(),
-            ),
+            correction_memory_text: Some("- pepper x -> Pepper X\n- chat gbt -> ChatGPT".into()),
             prompt_profile: ORDINARY_DICTATION_PROMPT_PROFILE.into(),
             custom_prompt_text: None,
             cleanup_use_gpu: false,
@@ -385,4 +387,53 @@ mod cleanup_runtime {
         assert!(request.cleanup_use_gpu);
         assert_eq!(request.cleanup_gpu_layers, 33);
     }
+
+    #[test]
+    fn chunk_transcript_keeps_short_text_as_single_chunk() {
+        use crate::cleanup::chunk_transcript;
+
+        let text = "hello from pepper x, short dictation only";
+        let chunks = chunk_transcript(text, 2400);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], text);
+    }
+
+    #[test]
+    fn chunk_transcript_splits_long_text_near_sentence_boundary() {
+        use crate::cleanup::chunk_transcript;
+
+        // Build ~5000 chars with clear sentence boundaries.
+        let sentence = "Ceci est une phrase de test pour le nettoyage. ";
+        let text = sentence.repeat(120); // ~5520 chars
+        assert!(text.chars().count() > 2400);
+
+        let chunks = chunk_transcript(&text, 2400);
+        assert!(chunks.len() >= 2, "expected multiple chunks, got {}", chunks.len());
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= 2400,
+                "chunk too long: {} chars",
+                chunk.chars().count()
+            );
+            assert!(!chunk.is_empty());
+        }
+        // Rejoining with spaces should preserve most content (trim drops edges).
+        let rejoined = chunks.join(" ");
+        assert!(rejoined.contains("Ceci est une phrase"));
+        assert!(rejoined.chars().count() + 200 >= text.trim().chars().count());
+    }
+
+    #[test]
+    fn chunk_transcript_prefers_newline_boundaries() {
+        use crate::cleanup::chunk_transcript;
+
+        let line = "a".repeat(100);
+        let text = format!("{line}\n{line}\n{line}\n{line}\n{line}");
+        let chunks = chunk_transcript(&text, 250);
+        assert!(chunks.len() >= 2);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 250);
+        }
+    }
+
 }

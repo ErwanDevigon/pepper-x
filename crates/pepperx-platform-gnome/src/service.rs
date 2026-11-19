@@ -9,6 +9,15 @@ use zbus::{
     fdo, interface,
 };
 
+/// Informational (non-error) logging is opt-in: set `PEPPERX_VERBOSE=1` to
+/// print progress/timing messages. Errors are always printed.
+fn verbose_logging() -> bool {
+    static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERBOSE.get_or_init(|| {
+        std::env::var_os("PEPPERX_VERBOSE").is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     ShowSettings,
@@ -73,6 +82,7 @@ struct ServiceState {
     live_status: SharedLiveStatus,
     capabilities: Mutex<Capabilities>,
     command_sender: Sender<AppCommand>,
+    extension_connected_listener: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
 }
 
 impl PepperXService {
@@ -87,8 +97,20 @@ impl PepperXService {
                 live_status,
                 capabilities: Mutex::new(Capabilities::shell_default(env!("CARGO_PKG_VERSION"))),
                 command_sender,
+                extension_connected_listener: Mutex::new(None),
             }),
         }
+    }
+
+    pub fn set_extension_connected_listener(
+        &self,
+        listener: impl Fn(bool) + Send + Sync + 'static,
+    ) {
+        *self
+            .state
+            .extension_connected_listener
+            .lock()
+            .expect("extension listener poisoned") = Some(Arc::new(listener));
     }
 
     pub fn set_modifier_only_supported(&self, supported: bool) {
@@ -105,24 +127,40 @@ impl PepperXService {
 
     pub fn start_modifier_only_recording(&self) {
         match self.start_session(TriggerSource::ModifierOnly) {
-            Ok(()) => eprintln!("[Pepper X] modifier-only start"),
+            Ok(()) if verbose_logging() => eprintln!("[Pepper X] modifier-only start"),
+            Ok(()) => {}
             Err(error) => eprintln!("[Pepper X] modifier-only start failed: {error}"),
         }
     }
 
     pub fn stop_modifier_only_recording(&self) {
         match self.stop_session() {
-            Ok(()) => eprintln!("[Pepper X] modifier-only stop"),
+            Ok(()) if verbose_logging() => eprintln!("[Pepper X] modifier-only stop"),
+            Ok(()) => {}
             Err(error) => eprintln!("[Pepper X] modifier-only stop failed: {error}"),
         }
     }
 
     fn mark_extension_connected(&self) {
-        self.state
+        let mut capabilities = self
+            .state
             .capabilities
             .lock()
-            .expect("capabilities lock poisoned")
-            .extension_connected = true;
+            .expect("capabilities lock poisoned");
+        if capabilities.extension_connected {
+            return;
+        }
+        capabilities.extension_connected = true;
+        drop(capabilities);
+        let listener = self
+            .state
+            .extension_connected_listener
+            .lock()
+            .expect("extension listener poisoned")
+            .clone();
+        if let Some(listener) = listener {
+            listener(true);
+        }
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -148,7 +186,9 @@ impl PepperXService {
         match self.state.recording_runtime.start_recording(trigger_source) {
             Ok(()) => Ok(()),
             Err(RecordingRuntimeError::DuplicateStart) => {
-                eprintln!("[Pepper X] duplicate request ignored: start");
+                if verbose_logging() {
+                    eprintln!("[Pepper X] duplicate request ignored: start");
+                }
                 Ok(())
             }
             Err(RecordingRuntimeError::DuplicateStop) => Err(fdo::Error::Failed(
@@ -164,7 +204,9 @@ impl PepperXService {
         match self.state.recording_runtime.stop_recording() {
             Ok(()) => Ok(()),
             Err(RecordingRuntimeError::DuplicateStop) => {
-                eprintln!("[Pepper X] duplicate request ignored: stop");
+                if verbose_logging() {
+                    eprintln!("[Pepper X] duplicate request ignored: stop");
+                }
                 Ok(())
             }
             Err(RecordingRuntimeError::DuplicateStart) => Err(fdo::Error::Failed(
@@ -346,7 +388,7 @@ mod service_contract {
             Capabilities {
                 modifier_only_supported: false,
                 extension_connected: false,
-                version: "0.1.0".to_string(),
+                version: "1.0.0".to_string(),
             }
         );
     }
@@ -428,7 +470,7 @@ mod service_contract {
             Capabilities {
                 modifier_only_supported: false,
                 extension_connected: false,
-                version: "0.1.0".to_string(),
+                version: "1.0.0".to_string(),
             }
         );
     }

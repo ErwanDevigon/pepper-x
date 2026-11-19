@@ -9,24 +9,50 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::sync::Arc;
 
 use crate::app_model::{initial_surface, AppModel, InitialSurface};
 use crate::background::BackgroundController;
 use crate::history_store::{ArchivedRun, HistoryStore};
 use crate::onboarding::show_onboarding_window;
-use crate::session_runtime::LiveRuntimeHandle;
+use crate::session_runtime::{publish_live_runtime, LiveRuntimeHandle};
 use crate::settings::{AppSettings, AppSetupState};
 use crate::startup_policy::startup_launch_policy;
-use crate::transcript_log::{state_root, TranscriptEntry};
-use crate::transcription::{
-    experiment_rerun_archived_cleanup, experiment_rerun_archived_run,
-    ArchivedCleanupRerunRequest, ArchivedRunRerunRequest,
-};
 use crate::status_pill::StatusPill;
+use crate::transcript_log::state_root;
+use crate::transcription::{
+    experiment_rerun_archived_cleanup, experiment_rerun_archived_run, ArchivedCleanupRerunRequest,
+    ArchivedRunRerunRequest,
+};
 use crate::window::{diagnostics_summary_text, MainWindow};
 
 pub const APPLICATION_ID: &str = "com.obra.PepperX";
+
+pub(crate) fn cleanup_rerun_request_from_settings(
+    settings: &AppSettings,
+    run_id: String,
+    cleanup_model_id: String,
+    custom_prompt: Option<String>,
+) -> ArchivedCleanupRerunRequest {
+    ArchivedCleanupRerunRequest {
+        run_id,
+        cleanup_model_id: Some(cleanup_model_id),
+        cleanup_prompt_profile: Some(settings.cleanup_prompt_profile.clone()),
+        custom_prompt_text: custom_prompt,
+    }
+}
+
+pub(crate) fn cleanup_rerun_entry_or_log<E: std::fmt::Display>(
+    result: Result<crate::transcript_log::TranscriptEntry, E>,
+) -> Option<crate::transcript_log::TranscriptEntry> {
+    match result {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            eprintln!("[Pepper X] failed to rerun cleanup: {error}");
+            None
+        }
+    }
+}
 
 pub fn build_application() -> adw::Application {
     adw::Application::builder()
@@ -50,13 +76,9 @@ pub fn run() {
     let (command_sender, command_receiver) = mpsc::channel();
     let live_status = SharedLiveStatus::new();
     let live_runtime = build_live_runtime(&settings, live_status.clone());
-    let live_runtime_for_pump = live_runtime.clone();
-    let service_handle = ServiceHandle::start(
-        command_sender,
-        live_runtime,
-        live_status.clone(),
-    )
-    .expect("failed to start GNOME IPC service");
+    publish_live_runtime(live_runtime.clone());
+    let service_handle = ServiceHandle::start(command_sender, live_runtime, live_status.clone())
+        .expect("failed to start GNOME IPC service");
     let service = service_handle.service();
 
     // Clean up stale uinput helper socket from a previous run.
@@ -110,9 +132,20 @@ pub fn run() {
             })
             .ok();
     }
-    let shared_trigger_config = modifier_capture
-        .as_ref()
-        .map(|h| h.shared_config().clone());
+
+    // Keep the selected Parakeet TDT model loaded. The ONNX session is large
+    // and was previously rebuilt on every dictation.
+    {
+        std::thread::Builder::new()
+            .name("pepperx-asr-warmup".into())
+            .spawn(|| {
+                if let Err(error) = crate::transcription::prewarm_preferred_asr_model() {
+                    eprintln!("[Pepper X] ASR prewarm skipped: {error}");
+                }
+            })
+            .ok();
+    }
+    let shared_trigger_config = modifier_capture.as_ref().map(|h| h.shared_config().clone());
     let app_model = Rc::new(AppModel::for_startup(
         &setup_state,
         &settings,
@@ -163,23 +196,16 @@ pub fn run() {
                 }
             }
         })),
-        Some(Rc::new(
+        Some(Arc::new(
             move |run_id, cleanup_model_id: String, custom_prompt: Option<String>| {
                 let settings = AppSettings::load_or_default();
-                let request = ArchivedCleanupRerunRequest {
+                let request = cleanup_rerun_request_from_settings(
+                    &settings,
                     run_id,
-                    cleanup_model_id: Some(cleanup_model_id),
-                    cleanup_prompt_profile: Some(settings.cleanup_prompt_profile.clone()),
-                    custom_prompt_text: custom_prompt,
-                };
-
-                match experiment_rerun_archived_cleanup(request) {
-                    Ok(entry) => Some(entry),
-                    Err(error) => {
-                        eprintln!("[Pepper X] failed to rerun cleanup: {error}");
-                        None
-                    }
-                }
+                    cleanup_model_id,
+                    custom_prompt,
+                );
+                cleanup_rerun_entry_or_log(experiment_rerun_archived_cleanup(request))
             },
         )),
         Some(Rc::new(|wav_path| {
@@ -196,9 +222,7 @@ pub fn run() {
                         );
                     }
                     Err(_) => {
-                        let result = std::process::Command::new("paplay")
-                            .arg(&wav_path)
-                            .status();
+                        let result = std::process::Command::new("paplay").arg(&wav_path).status();
                         match result {
                             Ok(status) if status.success() => {}
                             Ok(status) => {
@@ -237,7 +261,6 @@ pub fn run() {
         live_status.clone(),
         service.clone(),
         command_receiver,
-        live_runtime_for_pump,
         status_pill,
     );
     app.connect_activate(move |app| {
@@ -302,7 +325,8 @@ pub fn load_history_runs() -> io::Result<Vec<ArchivedRun>> {
     HistoryStore::open(state_root())?.recent_runs()
 }
 
-pub fn load_history_entries() -> io::Result<Vec<TranscriptEntry>> {
+#[cfg(test)]
+pub fn load_history_entries() -> io::Result<Vec<crate::transcript_log::TranscriptEntry>> {
     HistoryStore::open(state_root())?.recent_entries()
 }
 
@@ -376,6 +400,13 @@ fn present_primary_surface(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // GTK widget wiring
+enum UiWake {
+    Command(AppCommand),
+    Status(pepperx_ipc::LiveStatus),
+    ExtensionConnected(bool),
+}
+
 fn install_command_pump(
     app: adw::Application,
     window: MainWindow,
@@ -384,35 +415,49 @@ fn install_command_pump(
     live_status: SharedLiveStatus,
     service: PepperXService,
     receiver: Receiver<AppCommand>,
-    live_runtime: std::sync::Arc<LiveRuntimeHandle>,
     status_pill: StatusPill,
 ) {
-    let last_play_sounds = Cell::new(true);
-    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
-        while let Ok(command) = receiver.try_recv() {
-            match command {
-                AppCommand::ShowSettings => {
-                    present_primary_surface(&app, &window, &app_model, &onboarding_window)
+    let (sender, ui_events) = async_channel::unbounded::<UiWake>();
+
+    app_model.update_extension_connected(service.current_capabilities().extension_connected);
+    let extension_sender = sender.clone();
+    service.set_extension_connected_listener(move |connected| {
+        let _ = extension_sender.try_send(UiWake::ExtensionConnected(connected));
+    });
+
+    let status_sender = sender.clone();
+    live_status.watch(move |status| {
+        let _ = status_sender.try_send(UiWake::Status(status));
+    });
+
+    std::thread::Builder::new()
+        .name("pepperx-command-pump".into())
+        .spawn(move || {
+            while let Ok(command) = receiver.recv() {
+                if sender.try_send(UiWake::Command(command)).is_err() {
+                    break;
                 }
-                AppCommand::ShowHistory => window.present_history(),
+            }
+        })
+        .ok();
+
+    // GTK widgets are !Send. This future stays on the main context and wakes only when an event arrives.
+    gtk::glib::spawn_future_local(async move {
+        while let Ok(event) = ui_events.recv().await {
+            match event {
+                UiWake::Command(AppCommand::ShowSettings) => {
+                    present_primary_surface(&app, &window, &app_model, &onboarding_window);
+                }
+                UiWake::Command(AppCommand::ShowHistory) => window.present_history(),
+                UiWake::Status(status) => {
+                    window.set_live_status(&status);
+                    status_pill.set_live_status(&status);
+                }
+                UiWake::ExtensionConnected(connected) => {
+                    app_model.update_extension_connected(connected);
+                }
             }
         }
-
-        let capabilities = service.current_capabilities();
-        app_model.update_extension_connected(capabilities.extension_connected);
-        let snapshot = live_status.snapshot();
-        window.set_live_status(&snapshot);
-        status_pill.set_live_status(&snapshot);
-
-        // Sync play_sounds setting to runtime (settings toggle saves to disk,
-        // we propagate to the live runtime here).
-        let settings = AppSettings::load_or_default();
-        if settings.play_sounds != last_play_sounds.get() {
-            live_runtime.set_play_sounds(settings.play_sounds);
-            last_play_sounds.set(settings.play_sounds);
-        }
-
-        gtk::glib::ControlFlow::Continue
     });
 }
 
@@ -520,7 +565,7 @@ mod app_shell {
             &Capabilities {
                 modifier_only_supported: true,
                 extension_connected: false,
-                version: "0.1.0".into(),
+                version: "1.0.0".into(),
             },
             ready_model_bootstrap(),
         );
@@ -546,7 +591,7 @@ mod app_shell {
         let app_model = AppModel::for_startup_with_model_bootstrap(
             &setup_state,
             &settings,
-            &Capabilities::shell_default("0.1.0"),
+            &Capabilities::shell_default("1.0.0"),
             ready_model_bootstrap(),
         );
 
@@ -569,7 +614,7 @@ mod app_shell {
             &Capabilities {
                 modifier_only_supported: true,
                 extension_connected: false,
-                version: "0.1.0".into(),
+                version: "1.0.0".into(),
             },
             ready_model_bootstrap(),
         );
@@ -603,7 +648,7 @@ mod app_shell {
         let app_model = AppModel::for_startup_with_model_bootstrap(
             &setup_state,
             &settings,
-            &Capabilities::shell_default("0.1.0"),
+            &Capabilities::shell_default("1.0.0"),
             ready_model_bootstrap(),
         );
 
@@ -629,7 +674,7 @@ mod app_shell {
         let app_model = AppModel::for_startup_with_model_bootstrap(
             &setup_state,
             &settings,
-            &Capabilities::shell_default("0.1.0"),
+            &Capabilities::shell_default("1.0.0"),
             ready_model_bootstrap(),
         );
 

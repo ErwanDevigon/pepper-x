@@ -2,17 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use pepperx_asr::{
-    filter_other_speakers, transcribe_wav, TranscriptionError, TranscriptionRequest,
-    TranscriptionResult,
+    convert_to_temp_mono_16k_wav, filter_other_speakers, transcribe_wav, TranscriptionError,
+    TranscriptionRequest, TranscriptionResult,
 };
 use pepperx_audio::RecordingArtifact;
-use pepperx_cleanup::{
-    run_cleanup, safe_run_cleanup, CleanupError, CleanupRequest, CleanupResult,
-};
+use pepperx_cleanup::{safe_run_cleanup, CleanupError, CleanupRequest, CleanupResult};
 use pepperx_corrections::{learn_correction, CorrectionStore};
 use pepperx_ipc::{LiveStatus, SharedLiveStatus};
 use pepperx_models::{catalog_model, default_cache_root, model_readiness, ModelKind};
@@ -34,6 +33,15 @@ use crate::transcript_log::{
     nonempty_env_path, state_root, CleanupDiagnostics, DiarizationSummary, InsertionDiagnostics,
     LearningDiagnostics, TranscriptEntry,
 };
+
+/// Informational (non-error) logging is opt-in: set `PEPPERX_VERBOSE=1` to
+/// print progress/timing messages. Errors are always printed.
+pub(crate) fn verbose_logging() -> bool {
+    static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERBOSE.get_or_init(|| {
+        std::env::var_os("PEPPERX_VERBOSE").is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
 
 #[cfg(test)]
 const MODEL_NAME: &str = "nemotron-speech-streaming-en-0.6b";
@@ -221,22 +229,64 @@ pub struct ExternalAudioImportResult {
     pub markdown_path: PathBuf,
 }
 
-/// Transcribe an external WAV, archive it as a history run (`wav-import`),
-/// and write a Markdown transcript next to the source audio file.
+/// Transcribe an external audio file (WAV/MP3/FLAC/OGG/AAC/…), archive it as a
+/// history run (`wav-import`), and write a Markdown transcript next to the
+/// source audio file.
+///
+/// The source is always converted to a temporary mono 16 kHz WAV before ASR so
+/// Nemotron receives canonical PCM regardless of container (FLAC/MP3/…). The
+/// temp WAV is what gets archived as `source.wav`; the `.md` is written beside
+/// the original user file.
 pub fn import_external_audio_file(
     audio_path: &Path,
 ) -> Result<ExternalAudioImportResult, TranscriptionRunError> {
+    let temp_wav = convert_to_temp_mono_16k_wav(audio_path)
+        .map_err(|error| TranscriptionRunError::Asr(map_import_decode_error(error)))?;
+
     let settings = AppSettings::load_or_default();
-    let entry = if settings.cleanup_enabled {
-        transcribe_wav_and_cleanup_to_log(audio_path)?
+    let mut entry = if settings.cleanup_enabled {
+        transcribe_wav_and_cleanup_to_log(temp_wav.path())?
     } else {
-        transcribe_wav_to_log(audio_path)?
+        transcribe_wav_to_log(temp_wav.path())?
     };
+    // Keep the original path in the transcript entry for display / markdown.
+    entry.source_wav_path = audio_path.to_path_buf();
+
     let markdown_path = write_transcript_markdown_beside_audio(audio_path, &entry)?;
     Ok(ExternalAudioImportResult {
         entry,
         markdown_path,
     })
+}
+
+fn map_import_decode_error(error: pepperx_asr::DecodeError) -> TranscriptionError {
+    match error {
+        pepperx_asr::DecodeError::MissingFile(path)
+        | pepperx_asr::DecodeError::OpenFailed(path) => TranscriptionError::MissingWavFile(path),
+        pepperx_asr::DecodeError::UnsupportedFormat(path) => {
+            TranscriptionError::AudioDecodeFailed {
+                path,
+                detail: "unsupported audio format".into(),
+            }
+        }
+        pepperx_asr::DecodeError::NoAudioTrack(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "no audio track found".into(),
+        },
+        pepperx_asr::DecodeError::MissingSampleRate(path) => {
+            TranscriptionError::AudioDecodeFailed {
+                path,
+                detail: "missing sample rate metadata".into(),
+            }
+        }
+        pepperx_asr::DecodeError::EmptyAudio(path) => TranscriptionError::AudioDecodeFailed {
+            path,
+            detail: "decoded audio is empty".into(),
+        },
+        pepperx_asr::DecodeError::DecodeFailed { path, detail } => {
+            TranscriptionError::AudioDecodeFailed { path, detail }
+        }
+    }
 }
 
 /// Markdown path beside the audio: `meeting.wav` → `meeting.md`.
@@ -289,11 +339,7 @@ fn format_transcript_markdown(audio_path: &Path, entry: &TranscriptEntry) -> Str
                 .as_ref()
                 .map(|c| c.model_name.as_str())
                 .unwrap_or("cleanup"),
-            entry
-                .cleanup
-                .as_ref()
-                .map(|c| c.elapsed_ms)
-                .unwrap_or(0)
+            entry.cleanup.as_ref().map(|c| c.elapsed_ms).unwrap_or(0)
         ));
     }
     body
@@ -333,16 +379,18 @@ fn transcribe_recorded_wav_to_log_with_live_status(
         let filtered_wav = original_wav.with_extension("filtered.wav");
         match filter_other_speakers(&original_wav, &filtered_wav) {
             Ok(result) => {
-                if result.filtering_applied {
-                    eprintln!(
-                        "[Pepper X] speaker filter: kept {}/{} segments ({:.1}s -> {:.1}s)",
-                        result.target_speaker_segments,
-                        result.segment_count,
-                        result.original_duration.as_secs_f64(),
-                        result.filtered_duration.as_secs_f64(),
-                    );
-                } else if let Some(reason) = result.fallback_reason.as_deref() {
-                    eprintln!("[Pepper X] speaker filter: fallback ({reason})");
+                if verbose_logging() {
+                    if result.filtering_applied {
+                        eprintln!(
+                            "[Pepper X] speaker filter: kept {}/{} segments ({:.1}s -> {:.1}s)",
+                            result.target_speaker_segments,
+                            result.segment_count,
+                            result.original_duration.as_secs_f64(),
+                            result.filtered_duration.as_secs_f64(),
+                        );
+                    } else if let Some(reason) = result.fallback_reason.as_deref() {
+                        eprintln!("[Pepper X] speaker filter: fallback ({reason})");
+                    }
                 }
                 Some(result)
             }
@@ -359,13 +407,11 @@ fn transcribe_recorded_wav_to_log_with_live_status(
     // recording artifact pointing at it so the transcription step uses the
     // filtered audio.
     let effective_artifact = match speaker_filter_result.as_ref() {
-        Some(result) if result.filtering_applied => {
-            pepperx_audio::RecordingArtifact::new(
-                &result.filtered_wav_path,
-                request.recording_artifact().selected_microphone().cloned(),
-                result.filtered_duration,
-            )
-        }
+        Some(result) if result.filtering_applied => pepperx_audio::RecordingArtifact::new(
+            &result.filtered_wav_path,
+            request.recording_artifact().selected_microphone().cloned(),
+            result.filtered_duration,
+        ),
         _ => request.recording_artifact().clone(),
     };
     // If the recording produced a streaming transcript, extract it before
@@ -384,10 +430,7 @@ fn transcribe_recorded_wav_to_log_with_live_status(
             request.trigger_source(),
             |wav_path| {
                 let t = Instant::now();
-                let result = streaming_transcript_or_batch(
-                    streaming_transcript.as_ref(),
-                    wav_path,
-                );
+                let result = streaming_transcript_or_batch(streaming_transcript.as_ref(), wav_path);
                 transcribe_elapsed.set(t.elapsed());
                 result
             },
@@ -436,10 +479,7 @@ fn transcribe_recorded_wav_to_log_with_live_status(
             request.trigger_source(),
             |wav_path| {
                 let t = Instant::now();
-                let result = streaming_transcript_or_batch(
-                    streaming_transcript.as_ref(),
-                    wav_path,
-                );
+                let result = streaming_transcript_or_batch(streaming_transcript.as_ref(), wav_path);
                 transcribe_elapsed.set(t.elapsed());
                 result
             },
@@ -476,14 +516,16 @@ fn transcribe_recorded_wav_to_log_with_live_status(
     });
 
     let total_elapsed = pipeline_start.elapsed();
-    eprintln!(
-        "[Pepper X] perf: record={:.1}s transcribe={:.1}s cleanup={:.1}s insert={:.1}s total={:.1}s",
-        recording_elapsed.as_secs_f64(),
-        transcribe_elapsed.get().as_secs_f64(),
-        cleanup_elapsed.get().as_secs_f64(),
-        insert_elapsed.get().as_secs_f64(),
-        total_elapsed.as_secs_f64(),
-    );
+    if verbose_logging() {
+        eprintln!(
+            "[Pepper X] perf: record={:.1}s transcribe={:.1}s cleanup={:.1}s insert={:.1}s total={:.1}s",
+            recording_elapsed.as_secs_f64(),
+            transcribe_elapsed.get().as_secs_f64(),
+            cleanup_elapsed.get().as_secs_f64(),
+            insert_elapsed.get().as_secs_f64(),
+            total_elapsed.as_secs_f64(),
+        );
+    }
 
     match result {
         Ok(entry) => {
@@ -644,25 +686,53 @@ fn request_uinput_text_insertion(
     }
 }
 
+/// Child of the uinput helper this process spawned.
+/// Kept for the process lifetime so a dead helper can be reaped. Dropped only
+/// when this process exits, which does not kill the helper.
+static UINPUT_HELPER_CHILD: Mutex<Option<Child>> = Mutex::new(None);
+
+/// `true` when the caller should spawn. A live child stays in `slot`.
+fn uinput_helper_should_spawn(slot: &mut Option<Child>) -> std::io::Result<bool> {
+    let Some(child) = slot.as_mut() else {
+        return Ok(true);
+    };
+    match child.try_wait()? {
+        None => Ok(false),
+        Some(_) => {
+            *slot = None;
+            Ok(true)
+        }
+    }
+}
+
 fn connect_or_spawn_uinput_helper(
     socket_path: &Path,
 ) -> Result<UnixStream, FriendlyInsertRunError> {
-    match UnixStream::connect(socket_path) {
-        Ok(stream) => return Ok(stream),
-        Err(_) => {
-            // Connection failed (not found, refused, etc.) — remove stale socket
-            // and spawn a fresh helper.
-            let _ = std::fs::remove_file(socket_path);
-        }
+    if let Ok(stream) = UnixStream::connect(socket_path) {
+        return Ok(stream);
     }
 
-    let helper_bin = configured_uinput_helper_bin_path();
-    Command::new(&helper_bin).spawn().map_err(|error| {
-        FriendlyInsertRunError::Access(format!(
-            "failed to launch Pepper X uinput helper {}: {error}",
-            helper_bin.display()
-        ))
-    })?;
+    {
+        let mut slot = UINPUT_HELPER_CHILD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let should_spawn = uinput_helper_should_spawn(&mut slot).map_err(|error| {
+            FriendlyInsertRunError::Access(format!(
+                "failed to check Pepper X uinput helper status: {error}"
+            ))
+        })?;
+        if should_spawn {
+            let _ = std::fs::remove_file(socket_path);
+            let helper_bin = configured_uinput_helper_bin_path();
+            let child = Command::new(&helper_bin).spawn().map_err(|error| {
+                FriendlyInsertRunError::Access(format!(
+                    "failed to launch Pepper X uinput helper {}: {error}",
+                    helper_bin.display()
+                ))
+            })?;
+            *slot = Some(child);
+        }
+    }
 
     let deadline = std::time::Instant::now() + UINPUT_HELPER_STARTUP_TIMEOUT;
     loop {
@@ -728,11 +798,14 @@ fn streaming_transcript_or_batch(
     wav_path: &Path,
 ) -> Result<TranscriptionResult, TranscriptionRunError> {
     if let Some(st) = streaming {
-        eprintln!(
-            "[Pepper X] using streaming transcript ({} ms): {:?}",
-            st.elapsed_ms,
-            st.transcript_text.chars().take(80).collect::<String>(),
-        );
+        // Verbose-only: this echoes dictated text to the terminal/journal.
+        if verbose_logging() {
+            eprintln!(
+                "[Pepper X] using streaming transcript ({} ms): {:?}",
+                st.elapsed_ms,
+                st.transcript_text.chars().take(80).collect::<String>(),
+            );
+        }
         return Ok(TranscriptionResult {
             wav_path: wav_path.to_path_buf(),
             transcript_text: st.transcript_text.clone(),
@@ -742,6 +815,13 @@ fn streaming_transcript_or_batch(
         });
     }
     transcribe_wav_result(wav_path)
+}
+
+pub(crate) fn prewarm_preferred_asr_model() -> Result<(), TranscriptionRunError> {
+    let settings = AppSettings::load_or_default();
+    let model_dir = configured_model_dir_for_model_id(&settings.preferred_asr_model)?;
+    pepperx_asr::prewarm_parakeet_tdt(&model_dir)?;
+    Ok(())
 }
 
 fn transcribe_wav_result(wav_path: &Path) -> Result<TranscriptionResult, TranscriptionRunError> {
@@ -754,8 +834,22 @@ fn transcribe_wav_result_with_model_id(
     model_id: &str,
 ) -> Result<TranscriptionResult, TranscriptionRunError> {
     let model_dir = configured_model_dir_for_model_id(model_id)?;
-    let request = TranscriptionRequest::new(wav_path, &model_dir, model_id);
+    let request = transcription_request_for_settings(wav_path, &model_dir, model_id);
     Ok(transcribe_wav(&request)?)
+}
+
+fn transcription_request_for_settings(
+    wav_path: &Path,
+    model_dir: &Path,
+    model_id: &str,
+) -> TranscriptionRequest {
+    let settings = AppSettings::load_or_default();
+    if crate::settings::asr_model_is_multilingual(model_id) {
+        let lang = crate::settings::resolve_asr_language(&settings.preferred_asr_language);
+        TranscriptionRequest::new_with_lang(wav_path, model_dir, model_id, lang)
+    } else {
+        TranscriptionRequest::new(wav_path, model_dir, model_id)
+    }
 }
 
 pub fn rerun_archived_run_to_log(
@@ -773,7 +867,7 @@ pub fn rerun_archived_run_to_log(
             } else {
                 configured_model_dir_for_model_id(model_id)?
             };
-            let request = TranscriptionRequest::new(wav_path, &model_dir, model_id);
+            let request = transcription_request_for_settings(wav_path, &model_dir, model_id);
             Ok(transcribe_wav(&request)?)
         },
         move |cleanup_model_id, request| {
@@ -814,7 +908,7 @@ pub fn experiment_rerun_archived_run(
             } else {
                 configured_model_dir_for_model_id(model_id)?
             };
-            let request = TranscriptionRequest::new(wav_path, &model_dir, model_id);
+            let request = transcription_request_for_settings(wav_path, &model_dir, model_id);
             Ok(transcribe_wav(&request)?)
         },
         move |cleanup_model_id, request| {
@@ -835,27 +929,6 @@ pub fn experiment_rerun_archived_run(
             safe_run_cleanup(&request)
         },
     )
-}
-
-pub fn rerun_archived_cleanup_to_log(
-    request: ArchivedCleanupRerunRequest,
-) -> Result<TranscriptEntry, TranscriptionRunError> {
-    let cache_root = default_cache_root();
-    let explicit_cleanup_model = request.cleanup_model_id.is_some();
-    rerun_archived_cleanup_with(request, move |cleanup_model_id, cleanup_request| {
-        let cleanup_request = CleanupRequest {
-            model_path: if explicit_cleanup_model {
-                configured_requested_cleanup_model_path_for_model_id_with(
-                    cleanup_model_id,
-                    &cache_root,
-                )?
-            } else {
-                configured_cleanup_model_path_for_model_id(cleanup_model_id, &cache_root)?
-            },
-            ..cleanup_request
-        };
-        safe_run_cleanup(&cleanup_request)
-    })
 }
 
 /// Run cleanup against an archived run without writing a new history entry.
@@ -882,6 +955,7 @@ pub fn experiment_rerun_archived_cleanup(
     })
 }
 
+#[cfg(test)]
 fn rerun_archived_cleanup_with<C>(
     request: ArchivedCleanupRerunRequest,
     cleanup: C,
@@ -1278,6 +1352,7 @@ where
     archive_transcript_entry_with_request(entry, runtime_metadata, None, None, None)
 }
 
+#[cfg(test)]
 fn archive_transcription_result_with_cleanup_and_friendly_insert<C, I>(
     result: TranscriptionResult,
     prompt_profile: Option<String>,
@@ -1584,7 +1659,7 @@ fn update_live_status_after_success(live_status: &SharedLiveStatus, entry: &Tran
 fn describe_asr_error(error: &TranscriptionError) -> String {
     match error {
         TranscriptionError::MissingWavFile(path) => {
-            format!("WAV file does not exist: {}", path.display())
+            format!("audio file does not exist: {}", path.display())
         }
         TranscriptionError::IncompleteModelDir {
             model_dir,
@@ -1595,18 +1670,28 @@ fn describe_asr_error(error: &TranscriptionError) -> String {
             model_dir.display()
         ),
         TranscriptionError::InvalidWaveFile(path) => {
-            format!("invalid WAV file: {}", path.display())
+            format!("invalid or unsupported audio file: {}", path.display())
+        }
+        TranscriptionError::AudioDecodeFailed { path, detail } => {
+            format!(
+                "audio convert/decode failed for {}: {detail}",
+                path.display()
+            )
         }
         TranscriptionError::RecognizerInitializationFailed(model_dir) => format!(
             "failed to initialize recognizer from {}",
             model_dir.display()
         ),
         TranscriptionError::DecodeFailed(path) => {
-            format!("failed to decode {}", path.display())
+            format!("failed to transcribe {}", path.display())
+        }
+        // New error variant for multilingual support
+        TranscriptionError::LanguageConfigFailed(msg) => {
+            format!("language configuration failed: {}", msg)
         }
     }
 }
-
+#[cfg(test)]
 fn configured_model_dir() -> Result<PathBuf, TranscriptionRunError> {
     match std::env::var_os("PEPPERX_PARAKEET_MODEL_DIR") {
         Some(value) if !value.is_empty() => return Ok(PathBuf::from(value)),
@@ -1663,6 +1748,7 @@ fn configured_requested_cleanup_model_path_for_model_id_with(
     resolve_cleanup_model_path_for_model_id_with(model_id, cache_root, false)
 }
 
+#[cfg(test)]
 fn configured_model_dir_with(
     settings: &AppSettings,
     cache_root: &Path,
@@ -1670,6 +1756,7 @@ fn configured_model_dir_with(
     configured_model_dir_for_model_id_with(&settings.preferred_asr_model, cache_root)
 }
 
+#[cfg(test)]
 fn configured_model_dir_for_model_id_with(
     model_id: &str,
     cache_root: &Path,
@@ -1712,6 +1799,7 @@ fn configured_cleanup_model_path_with(
     configured_cleanup_model_path_for_model_id(&settings.preferred_cleanup_model, cache_root)
 }
 
+#[cfg(test)]
 fn configured_cleanup_model_path_for_model_id_with(
     model_id: &str,
     cache_root: &Path,
@@ -1997,7 +2085,7 @@ mod app_shell {
 
     #[test]
     fn model_status_cleanup_model_env_override_takes_precedence_over_settings() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let override_path = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-override-{}-{}.gguf",
             std::process::id(),
@@ -2038,7 +2126,7 @@ mod app_shell {
 
     #[test]
     fn rerun_explicit_asr_model_ignores_env_override_path() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let cache_root = std::env::temp_dir().join(format!(
             "pepper-x-rerun-asr-explicit-{}-{}",
             std::process::id(),
@@ -2071,7 +2159,7 @@ mod app_shell {
 
     #[test]
     fn rerun_explicit_cleanup_model_ignores_env_override_path() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let cache_root = std::env::temp_dir().join(format!(
             "pepper-x-rerun-cleanup-explicit-{}-{}",
             std::process::id(),
@@ -2085,8 +2173,7 @@ mod app_shell {
         std::fs::create_dir_all(&cache_root).unwrap();
         std::fs::write(&override_path, b"override-model").unwrap();
         std::env::set_var("PEPPERX_CLEANUP_MODEL_PATH", &override_path);
-        let expected_path =
-            materialize_ready_model(&cache_root, "qwen3.5-0.8b-q4_k_m.gguf");
+        let expected_path = materialize_ready_model(&cache_root, "qwen3.5-0.8b-q4_k_m.gguf");
 
         let configured_path = configured_requested_cleanup_model_path_for_model_id_with(
             "qwen3.5-0.8b-q4_k_m.gguf",
@@ -2115,11 +2202,9 @@ mod app_shell {
                 .as_nanos()
         ));
 
-        let error = configured_requested_model_dir_for_model_id_with(
-            "qwen3.5-2b-q4_k_m.gguf",
-            &cache_root,
-        )
-        .unwrap_err();
+        let error =
+            configured_requested_model_dir_for_model_id_with("qwen3.5-2b-q4_k_m.gguf", &cache_root)
+                .unwrap_err();
 
         assert!(matches!(
             error,
@@ -2153,7 +2238,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_context_capture_can_be_explicitly_disabled_for_headless_runs() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let previous = std::env::var_os(DISABLE_CONTEXT_CAPTURE_ENV);
         std::env::set_var(DISABLE_CONTEXT_CAPTURE_ENV, "1");
 
@@ -2168,7 +2253,7 @@ mod app_shell {
 
     #[test]
     fn app_shell_archives_friendly_insert_success_diagnostics() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-friendly-insert-success-{}-{}",
             std::process::id(),
@@ -2235,7 +2320,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_runtime_archives_cleaned_text_separately_from_raw_transcript() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-success-{}-{}",
             std::process::id(),
@@ -2293,7 +2378,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_runtime_falls_back_to_raw_transcript_when_model_is_unavailable() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-failure-{}-{}",
             std::process::id(),
@@ -2383,7 +2468,7 @@ mod app_shell {
             SupportingContext::default(),
             |transcript_text| {
                 let model_path = configured_cleanup_model_path()?;
-                run_cleanup(&CleanupRequest {
+                pepperx_cleanup::run_cleanup(&CleanupRequest {
                     transcript_text: transcript_text.into(),
                     model_path,
                     supporting_context_text: None,
@@ -2435,7 +2520,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_ocr_runtime_archives_used_ocr_flag_from_cleanup_result() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-ocr-{}-{}",
             std::process::id(),
@@ -2494,7 +2579,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_ocr_runtime_archives_supporting_context_artifacts() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-context-{}-{}",
             std::process::id(),
@@ -2558,7 +2643,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_corrections_runtime_does_not_rewrite_cleanup_output() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-corrections-preferred-{}-{}",
             std::process::id(),
@@ -2618,7 +2703,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_corrections_runtime_keeps_phrase_replacement_memory_out_of_current_output() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-corrections-replacements-{}-{}",
             std::process::id(),
@@ -2679,7 +2764,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_ocr_runtime_archives_used_ocr_flag_on_cleanup_failure() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-ocr-failure-{}-{}",
             std::process::id(),
@@ -2738,7 +2823,7 @@ mod app_shell {
 
     #[test]
     fn app_shell_archives_clipboard_insert_success_diagnostics() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-clipboard-insert-success-{}-{}",
             std::process::id(),
@@ -2961,6 +3046,75 @@ mod app_shell {
     }
 
     #[test]
+    fn uinput_helper_connects_open_socket_without_spawn() {
+        let _guard = lock_env();
+        let previous_helper_bin = std::env::var_os("PEPPERX_UINPUT_HELPER_BIN");
+        std::env::set_var(
+            "PEPPERX_UINPUT_HELPER_BIN",
+            "/no/such/pepperx-uinput-helper",
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "pepper-x-uinput-sock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("helper.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let accepted = std::thread::spawn(move || listener.accept());
+
+        let connected = connect_or_spawn_uinput_helper(&socket_path);
+        set_or_remove_env_var("PEPPERX_UINPUT_HELPER_BIN", previous_helper_bin);
+        let stream = connected.expect("open socket connects without spawning a helper");
+        drop(stream);
+        accepted
+            .join()
+            .expect("accept thread")
+            .expect("accept connection");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uinput_helper_reaps_dead_child_and_keeps_a_live_one() {
+        let mut live = Some(Command::new("sleep").arg("30").spawn().expect("sleep"));
+        let live_id = live.as_ref().expect("child").id();
+        assert!(!uinput_helper_should_spawn(&mut live).expect("try_wait"));
+        assert_eq!(live.as_ref().expect("still held").id(), live_id);
+
+        live.as_mut().expect("child").kill().expect("kill sleep");
+        let mut reaped = false;
+        for _ in 0..50 {
+            if uinput_helper_should_spawn(&mut live).expect("try_wait") {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if let Some(child) = live.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(reaped, "dead helper is reaped so a new one can spawn");
+        assert!(live.is_none());
+
+        let mut finished = Some(Command::new("true").spawn().expect("true"));
+        let mut exited = false;
+        for _ in 0..50 {
+            if uinput_helper_should_spawn(&mut finished).expect("try_wait") {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(exited, "exited helper is reaped");
+        assert!(finished.is_none());
+    }
+
+    #[test]
     fn uinput_insert_archives_last_fallback_diagnostics() {
         let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
@@ -3036,7 +3190,7 @@ mod app_shell {
 
     #[test]
     fn app_shell_archives_friendly_insert_failure_diagnostics() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-friendly-insert-failure-{}-{}",
             std::process::id(),
@@ -3089,7 +3243,7 @@ mod app_shell {
 
     #[test]
     fn app_shell_archives_selected_backend_failure_diagnostics() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-selected-backend-failure-{}-{}",
             std::process::id(),
@@ -3153,7 +3307,7 @@ mod app_shell {
 
     #[test]
     fn app_shell_archives_unsupported_target_failure_application_name() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-unsupported-target-failure-{}-{}",
             std::process::id(),
@@ -3174,7 +3328,7 @@ mod app_shell {
                 elapsed_ms: 42,
             },
             |_| {
-                Err(FriendlyInsertRunError::UnsupportedTarget(
+                Err(FriendlyInsertRunError::UnsupportedTarget(Box::new(
                     pepperx_platform_gnome::atspi::FriendlyInsertFailure {
                         backend_name: FRIENDLY_INSERT_BACKEND_NAME,
                         reason:
@@ -3186,7 +3340,7 @@ mod app_shell {
                         target_class: Some("unsupported"),
                         attempted_backends: Vec::new(),
                     },
-                ))
+                )))
             },
         )
         .expect("archive entry");
@@ -3211,7 +3365,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_insert_runtime_uses_cleaned_text_for_friendly_insertion() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-insert-success-{}-{}",
             std::process::id(),
@@ -3295,7 +3449,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_insert_runtime_returns_insertion_error_after_archiving_entry() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-insert-failure-{}-{}",
             std::process::id(),
@@ -3374,8 +3528,11 @@ mod app_shell {
     }
 
     #[test]
+    #[ignore = "performs real AT-SPI/uinput text insertion; without an accessibility bus \
+                libatspi aborts the whole test binary (SIGTRAP). Run manually inside a \
+                GNOME session with --ignored."]
     fn cleanup_insert_runtime_skips_cleanup_when_settings_disable_it() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-disabled-{}-{}",
             std::process::id(),
@@ -3440,7 +3597,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_insert_runtime_archives_live_transcription_failures_for_retry() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-live-cleanup-insert-transcription-failure-{}-{}",
             std::process::id(),
@@ -3486,6 +3643,13 @@ mod app_shell {
             .next()
             .expect("expected archived run");
 
+        match previous_state_root {
+            Some(previous_state_root) => {
+                std::env::set_var("PEPPERX_STATE_ROOT", previous_state_root)
+            }
+            None => std::env::remove_var("PEPPERX_STATE_ROOT"),
+        }
+
         assert!(matches!(
             error,
             TranscriptionRunError::Asr(TranscriptionError::DecodeFailed(_))
@@ -3504,7 +3668,7 @@ mod app_shell {
             .with_failure(
                 "transcription",
                 format!(
-                    "Pepper X transcription failed: failed to decode {}",
+                    "Pepper X transcription failed: failed to transcribe {}",
                     source_wav_path.display()
                 ),
             )
@@ -3514,18 +3678,12 @@ mod app_shell {
             Some(archived.run_dir.join("source.wav").as_path())
         );
 
-        match previous_state_root {
-            Some(previous_state_root) => {
-                std::env::set_var("PEPPERX_STATE_ROOT", previous_state_root)
-            }
-            None => std::env::remove_var("PEPPERX_STATE_ROOT"),
-        }
         let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
     fn cleanup_insert_runtime_archives_live_runtime_metadata_for_recorded_runs() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-live-runtime-metadata-success-{}-{}",
             std::process::id(),
@@ -3611,7 +3769,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_insert_runtime_archives_live_browser_targets_honestly() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-live-browser-target-{}-{}",
             std::process::id(),
@@ -3707,7 +3865,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_insert_runtime_archives_live_terminal_fallback_honestly() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-live-terminal-target-{}-{}",
             std::process::id(),
@@ -3803,7 +3961,7 @@ mod app_shell {
 
     #[test]
     fn cleanup_insert_runtime_archives_live_runtime_metadata_on_insertion_failure() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-live-runtime-metadata-insert-failure-{}-{}",
             std::process::id(),
@@ -3879,7 +4037,7 @@ mod app_shell {
 
     #[test]
     fn post_paste_learning_persists_prompt_memory_for_future_cleanup() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-post-paste-learning-success-{}-{}",
             std::process::id(),
@@ -3967,7 +4125,7 @@ mod app_shell {
 
     #[test]
     fn post_paste_learning_rejects_failed_insertions() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-post-paste-learning-failed-insert-{}-{}",
             std::process::id(),
@@ -4027,7 +4185,7 @@ mod app_shell {
 
     #[test]
     fn post_paste_learning_rejects_destructive_prompt_memory_updates() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-post-paste-learning-destructive-{}-{}",
             std::process::id(),
@@ -4090,7 +4248,7 @@ mod app_shell {
 
     #[test]
     fn rerun_archived_run_uses_archived_wav_and_override_models_and_prompt() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-rerun-archived-run-{}-{}",
             std::process::id(),
@@ -4224,7 +4382,7 @@ mod app_shell {
 
     #[test]
     fn rerun_archived_run_skips_cleanup_when_request_disables_it() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-rerun-skip-cleanup-{}-{}",
             std::process::id(),
@@ -4314,7 +4472,7 @@ mod app_shell {
 
     #[test]
     fn rerun_archived_run_uses_current_cleanup_defaults_when_enabled_without_overrides() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-rerun-default-cleanup-{}-{}",
             std::process::id(),
@@ -4423,7 +4581,7 @@ mod app_shell {
 
     #[test]
     fn rerun_archived_cleanup_reruns_cleanup_only_with_existing_transcript() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-rerun-cleanup-{}-{}",
             std::process::id(),
@@ -4504,7 +4662,10 @@ mod app_shell {
             cleanup_request.supporting_context_text.as_deref(),
             Some("line before\nline after")
         );
-        assert_eq!(cleanup_request.ocr_text.as_deref(), Some("ocr fallback text"));
+        assert_eq!(
+            cleanup_request.ocr_text.as_deref(),
+            Some("ocr fallback text")
+        );
         assert_eq!(entry.transcript_text, "hello from pepper x");
         assert_eq!(entry.display_text(), "Hello from Pepper X!");
         assert_eq!(
@@ -4532,7 +4693,7 @@ mod app_shell {
 
     #[test]
     fn rerun_archived_cleanup_on_rerun_links_back_to_original_parent() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let state_root = std::env::temp_dir().join(format!(
             "pepper-x-cleanup-rerun-parent-{}-{}",
             std::process::id(),

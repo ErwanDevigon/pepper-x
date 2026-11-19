@@ -1,6 +1,6 @@
 [package]
 name = "pepperx-platform-gnome"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 publish = false
 
@@ -9,7 +9,6 @@ path = "src/lib.rs"
 
 [dependencies]
 glib = "0.22.3"
-gtk = { package = "gtk4", version = "0.11.1", features = ["gnome_46"] }
 libc = "0.2"
 pepperx-ipc = { path = "../pepperx-ipc" }
 pepperx-session = { path = "../pepperx-session" }

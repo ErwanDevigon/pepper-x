@@ -105,10 +105,14 @@ pub fn screenshot_window(
     // no user dialog (when permission is already granted).
     let output = std::process::Command::new("gdbus")
         .args([
-            "call", "--session",
-            "--dest", "org.freedesktop.portal.Desktop",
-            "--object-path", "/org/freedesktop/portal/desktop",
-            "--method", "org.freedesktop.portal.Screenshot.Screenshot",
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.portal.Desktop",
+            "--object-path",
+            "/org/freedesktop/portal/desktop",
+            "--method",
+            "org.freedesktop.portal.Screenshot.Screenshot",
             "", // parent_window
             "{'interactive': <false>}",
         ])
@@ -135,10 +139,11 @@ pub fn screenshot_window(
         .map_err(|_| ScreenshotWindowError::Unavailable)?
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("Screenshot")
-                && e.path().extension().map(|ext| ext == "png").unwrap_or(false)
+            e.file_name().to_string_lossy().starts_with("Screenshot")
+                && e.path()
+                    .extension()
+                    .map(|ext| ext == "png")
+                    .unwrap_or(false)
         })
         .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
 
@@ -189,6 +194,7 @@ fn validated_png_path(path: &Path) -> Result<PathBuf, ScreenshotWindowError> {
     Ok(path.to_path_buf())
 }
 
+#[cfg(test)]
 fn interpret_screenshot_reply(
     success: bool,
     filename_used: impl Into<PathBuf>,
@@ -222,24 +228,6 @@ fn classify_dbus_error_name(name: &str) -> ScreenshotWindowError {
         | "org.freedesktop.DBus.Error.UnknownInterface"
         | "org.freedesktop.DBus.Error.UnknownMethod" => ScreenshotWindowError::Unavailable,
         other => ScreenshotWindowError::Dbus(other.to_owned()),
-    }
-}
-
-fn argument_name(argument: &str) -> &'static str {
-    if argument.contains("include_frame") {
-        "include_frame"
-    } else if argument.contains("include_cursor") {
-        "include_cursor"
-    } else if argument.contains("flash") {
-        "flash"
-    } else if argument.contains("filename_used") {
-        "filename_used"
-    } else if argument.contains("filename") && argument.contains("direction=\"in\"") {
-        "filename"
-    } else if argument.contains("success") {
-        "success"
-    } else {
-        "argument"
     }
 }
 

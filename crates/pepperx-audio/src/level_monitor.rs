@@ -335,9 +335,7 @@ fn resolve_selected_node_id(
     let deadline = Instant::now() + Duration::from_secs(5);
     while !done.get() && enumeration_error.borrow().is_none() {
         if Instant::now() >= deadline {
-            return Err(RecordingError::new(
-                "PipeWire node resolution timed out",
-            ));
+            return Err(RecordingError::new("PipeWire node resolution timed out"));
         }
         mainloop.loop_().iterate(Duration::from_millis(100));
     }
@@ -489,7 +487,7 @@ fn configure_capture_stream(
                         captured_audio.channel_count = format.channels() as u16;
                     }
 
-                    for sample_bytes in payload.chunks_exact(std::mem::size_of::<i16>()) {
+                    for sample_bytes in payload.as_chunks::<{ std::mem::size_of::<i16>() }>().0 {
                         captured_audio.interleaved_samples.push(
                             i16::from_le_bytes([sample_bytes[0], sample_bytes[1]]) as f32
                                 / i16::MAX as f32,

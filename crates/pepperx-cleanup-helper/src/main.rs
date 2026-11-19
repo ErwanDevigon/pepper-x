@@ -57,15 +57,27 @@ struct HelperResponse {
 
 impl HelperResponse {
     fn ok() -> Self {
-        Self { ok: true, text: None, error: None }
+        Self {
+            ok: true,
+            text: None,
+            error: None,
+        }
     }
 
     fn ok_text(text: String) -> Self {
-        Self { ok: true, text: Some(text), error: None }
+        Self {
+            ok: true,
+            text: Some(text),
+            error: None,
+        }
     }
 
     fn err(msg: String) -> Self {
-        Self { ok: false, text: None, error: Some(msg) }
+        Self {
+            ok: false,
+            text: None,
+            error: Some(msg),
+        }
     }
 }
 
@@ -272,7 +284,7 @@ fn main() {
     };
 
     // P-cores only on Intel hybrid; clamp to [2, 4].
-    let n_threads = (num_cpus::get_physical() as i32).min(4).max(2);
+    let n_threads = (num_cpus::get_physical() as i32).clamp(2, 4);
 
     eprintln!(
         "[pepperx-cleanup-helper] daemon started (pid={})",
@@ -297,9 +309,7 @@ fn main() {
         let request: HelperRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                write_response(&HelperResponse::err(format!(
-                    "invalid request JSON: {e}"
-                )));
+                write_response(&HelperResponse::err(format!("invalid request JSON: {e}")));
                 continue;
             }
         };
@@ -507,6 +517,7 @@ fn handle_prefill(
 // Generate
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn handle_generate(
     model: &'static LlamaModel,
     backend: &LlamaBackend,
@@ -574,10 +585,8 @@ fn handle_generate(
     let decode_ms = t0.elapsed().as_millis();
 
     // --- Autoregressive generation ---
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::temp(temperature),
-        LlamaSampler::dist(1),
-    ]);
+    let mut sampler =
+        LlamaSampler::chain_simple([LlamaSampler::temp(temperature), LlamaSampler::dist(1)]);
 
     let deadline = Instant::now() + INFERENCE_TIMEOUT;
     let mut generated = String::new();
@@ -590,11 +599,12 @@ fn handle_generate(
     let mut batch = LlamaBatch::new(1, 1);
     let mut first_iter = true;
 
+    // `n_cur` is the KV position of the next token; it starts at the prompt length,
+    // so a plain loop counter reads more clearly than zipping ranges.
+    #[allow(clippy::explicit_counter_loop)]
     for _ in 0..max_tokens {
-        if !first_iter {
-            if ctx.decode(&mut batch).is_err() {
-                break;
-            }
+        if !first_iter && ctx.decode(&mut batch).is_err() {
+            break;
         }
         first_iter = false;
 
@@ -612,9 +622,10 @@ fn handle_generate(
         };
         generated.push_str(&piece);
 
-        // Stop on newline (ignoring <think> blocks the model may emit).
-        let stripped = strip_think_blocks(&generated);
-        if stripped.contains('\n') || stripped.len() >= OUTPUT_LIMIT {
+        // Stop on a newline in the answer. Ignore <think> and a
+        // "Thinking Process:" header so Qwen does not return only that line.
+        let answer = answer_text(&generated);
+        if answer.contains('\n') || answer.len() >= OUTPUT_LIMIT {
             break;
         }
         if Instant::now() > deadline {
@@ -649,6 +660,20 @@ fn write_response(response: &HelperResponse) {
     let _ = serde_json::to_writer(&mut stdout, response);
     let _ = stdout.write_all(b"\n");
     let _ = stdout.flush();
+}
+
+fn answer_text(text: &str) -> String {
+    strip_think_blocks(text)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_thinking_preamble(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_thinking_preamble(line: &str) -> bool {
+    let trimmed = line.trim().trim_matches(':').trim();
+    trimmed.eq_ignore_ascii_case("thinking process")
 }
 
 fn strip_think_blocks(text: &str) -> String {

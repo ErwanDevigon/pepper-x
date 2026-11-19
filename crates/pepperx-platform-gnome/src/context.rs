@@ -1,19 +1,12 @@
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use zbus::blocking::Connection;
 
 use crate::atspi::{
     inspect_focused_target, FocusedTargetSnapshot, FriendlyInsertRunError, ProbeStatus,
     RecoveryAction, RecoveryProbe,
 };
-use crate::screenshot::{
-    introspect_interface_xml, screenshot_window, validate_interface_xml, ScreenshotContractError,
-    ScreenshotWindowError,
-};
+use crate::screenshot::{validate_interface_xml, ScreenshotContractError, ScreenshotWindowError};
 
 const SUPPORTING_CONTEXT_LIMIT: usize = 512;
 
@@ -61,12 +54,12 @@ pub fn capture_supporting_context() -> Result<SupportingContext, ContextCaptureE
         return Ok(atspi_context);
     }
 
-    // Screenshot+OCR fallback is disabled: it triggers GNOME's screenshot
-    // sound and notification. AT-SPI text access is preferred.
-    // TODO: Re-enable when we have a silent screenshot method.
+    // No AT-SPI text stays an empty context. OCR is not the fallback.
     Ok(SupportingContext::default())
 }
 
+// Parked OCR helpers. Missing AT-SPI text stays an empty context; this is not the fallback.
+#[allow(dead_code)]
 pub(crate) fn context_capture_probe(
     snapshot: Option<&FocusedTargetSnapshot>,
     screenshot_contract_xml: &str,
@@ -123,6 +116,8 @@ pub(crate) fn supporting_context_from_atspi(
     }
 }
 
+// Parked OCR helpers. Missing AT-SPI text stays an empty context; this is not the fallback.
+#[allow(dead_code)]
 pub(crate) fn capture_supporting_context_with<S, O>(
     snapshot: Option<FocusedTargetSnapshot>,
     screenshot_contract_xml: &str,
@@ -155,6 +150,8 @@ fn bound_text(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars.max(1)).collect()
 }
 
+// Parked OCR helpers. Missing AT-SPI text stays an empty context; this is not the fallback.
+#[allow(dead_code)]
 fn ocr_png_with_tesseract(image_path: &Path) -> Result<Option<String>, ContextCaptureError> {
     let output = Command::new("tesseract")
         .arg(image_path)
@@ -181,6 +178,8 @@ fn ocr_png_with_tesseract(image_path: &Path) -> Result<Option<String>, ContextCa
     }
 }
 
+// Parked OCR helpers. Missing AT-SPI text stays an empty context; this is not the fallback.
+#[allow(dead_code)]
 fn temporary_screenshot_path() -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -259,6 +258,46 @@ mod tests {
 
         let context = supporting_context_from_atspi(Some(&snapshot), None, 4);
 
+        assert_eq!(context.supporting_context_text, None);
+        assert_eq!(context.ocr_text, None);
+        assert!(!context.used_ocr);
+    }
+
+    #[test]
+    fn context_uses_buffer_tail_without_caret_and_skips_ocr() {
+        use crate::atspi::SUPPORTING_CONTEXT_NO_CARET_LIMIT;
+
+        let body = format!(
+            "scrollback-{}",
+            "x".repeat(SUPPORTING_CONTEXT_NO_CARET_LIMIT)
+        );
+        let snapshot = FocusedTargetSnapshot {
+            application_id: "org.gnome.Ptyxis".into(),
+            application_name: "Ptyxis".into(),
+            target_class: "terminal",
+            is_editable: false,
+            supports_text: true,
+            supports_editable_text: false,
+            supports_caret: false,
+            before_text: Some(body.clone()),
+            caret_offset: None,
+        };
+
+        let context = supporting_context_from_atspi(Some(&snapshot), Some("ocr fallback"), 4);
+        let tail = context
+            .supporting_context_text
+            .expect("text without a caret still yields context");
+        assert_eq!(tail.chars().count(), SUPPORTING_CONTEXT_NO_CARET_LIMIT);
+        assert!(body.ends_with(&tail));
+        assert_eq!(context.ocr_text, None);
+        assert!(!context.used_ocr);
+
+        let empty = FocusedTargetSnapshot {
+            before_text: Some(String::new()),
+            supports_text: false,
+            ..snapshot
+        };
+        let context = supporting_context_from_atspi(Some(&empty), None, 4);
         assert_eq!(context.supporting_context_text, None);
         assert_eq!(context.ocr_text, None);
         assert!(!context.used_ocr);
