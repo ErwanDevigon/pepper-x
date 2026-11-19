@@ -555,7 +555,8 @@ mod tests {
                 "toggle_trigger_keys": "56,57,100,125,126",
                 "ignore_other_speakers": false,
                 "enable_post_paste_learning": true,
-                "cleanup_use_gpu": false,
+                "asr_use_gpu": false,
+                "cleanup_use_gpu": true,
                 "cleanup_gpu_layers": 0
             })
         );
@@ -610,7 +611,8 @@ mod tests {
                 "toggle_trigger_keys": "56,57,100,125,126",
                 "ignore_other_speakers": false,
                 "enable_post_paste_learning": true,
-                "cleanup_use_gpu": false,
+                "asr_use_gpu": false,
+                "cleanup_use_gpu": true,
                 "cleanup_gpu_layers": 0
             })
         );
@@ -648,7 +650,8 @@ mod tests {
                 "toggle_trigger_keys": "56,57,100,125,126",
                 "ignore_other_speakers": false,
                 "enable_post_paste_learning": true,
-                "cleanup_use_gpu": false,
+                "asr_use_gpu": false,
+                "cleanup_use_gpu": true,
                 "cleanup_gpu_layers": 0
             })
         );
