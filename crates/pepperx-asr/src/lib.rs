@@ -9,6 +9,7 @@ pub use decoder::{
 };
 pub use speaker_filter::{filter_other_speakers, SpeakerFilterError, SpeakerFilterResult};
 pub use transcriber::{
-    load_audio_for_asr, prewarm_parakeet_tdt, transcribe_wav, StreamingTranscriber,
-    TranscriptionError, TranscriptionRequest, TranscriptionResult, BACKEND_NAME,
+    load_audio_for_asr, prewarm_parakeet_tdt, set_asr_use_gpu, transcribe_wav,
+    StreamingTranscriber, TranscriptionError, TranscriptionRequest, TranscriptionResult,
+    BACKEND_NAME,
 };

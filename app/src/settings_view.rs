@@ -107,6 +107,7 @@ pub struct SettingsView {
     asr_language_row: adw::ActionRow,
     asr_language_codes: Vec<String>,
     cleanup_switch: gtk::Switch,
+    asr_use_gpu_switch: gtk::Switch,
     cleanup_use_gpu_switch: gtk::Switch,
     cleanup_gpu_layers_row: adw::ActionRow,
     cleanup_gpu_layers_spin: gtk::SpinButton,
@@ -281,7 +282,6 @@ impl SettingsView {
             .activatable_widget(&cleanup_use_gpu_switch)
             .build();
         cleanup_use_gpu_row.add_suffix(&cleanup_use_gpu_switch);
-        cleanup_list.append(&list_box_row(&cleanup_use_gpu_row));
 
         let cleanup_gpu_layers_adjustment = gtk::Adjustment::new(0.0, 0.0, 999.0, 1.0, 10.0, 0.0);
         let cleanup_gpu_layers_spin = gtk::SpinButton::builder()
@@ -296,7 +296,6 @@ impl SettingsView {
             .visible(false)
             .build();
         cleanup_gpu_layers_row.add_suffix(&cleanup_gpu_layers_spin);
-        cleanup_list.append(&list_box_row(&cleanup_gpu_layers_row));
 
         let window_context_switch = gtk::Switch::builder().valign(Align::Center).build();
         let window_context_row = adw::ActionRow::builder()
@@ -482,6 +481,15 @@ impl SettingsView {
             .position(|id| *id == surface_state.preferred_asr_model)
             .unwrap_or(0);
         asr_model_dropdown.set_selected(asr_model_index as u32);
+        let asr_use_gpu_switch = gtk::Switch::builder().valign(Align::Center).build();
+        let asr_use_gpu_row = adw::ActionRow::builder()
+            .title("Use GPU for transcription")
+            .subtitle("Run the transcription model on the GPU when this build includes CUDA")
+            .activatable_widget(&asr_use_gpu_switch)
+            .build();
+        asr_use_gpu_row.add_suffix(&asr_use_gpu_switch);
+        models_list.append(&list_box_row(&asr_use_gpu_row));
+
         let asr_model_row = adw::ActionRow::builder()
             .title("Transcription model")
             .subtitle("Speech-to-text model for voice input")
@@ -535,6 +543,8 @@ impl SettingsView {
             .build();
         cleanup_model_row.add_suffix(&cleanup_model_dropdown);
         models_list.append(&list_box_row(&cleanup_model_row));
+        models_list.append(&list_box_row(&cleanup_use_gpu_row));
+        models_list.append(&list_box_row(&cleanup_gpu_layers_row));
         models_page.append(&models_list);
 
         // -- Model readiness status --
@@ -729,6 +739,7 @@ impl SettingsView {
             asr_language_row,
             asr_language_codes: asr_language_codes.iter().map(|s| s.to_string()).collect(),
             cleanup_switch,
+            asr_use_gpu_switch,
             cleanup_use_gpu_switch,
             cleanup_gpu_layers_row,
             cleanup_gpu_layers_spin,
@@ -781,6 +792,8 @@ impl SettingsView {
         self.updating_settings.set(true);
         self.cleanup_switch
             .set_active(surface_state.cleanup_enabled);
+        self.asr_use_gpu_switch
+            .set_active(surface_state.asr_use_gpu);
         self.cleanup_use_gpu_switch
             .set_active(surface_state.cleanup_use_gpu);
         self.cleanup_gpu_layers_spin
@@ -978,6 +991,33 @@ impl SettingsView {
                     feedback_label.set_label(&format!("Failed to save settings: {error}"));
                     feedback_label.set_visible(true);
                 } else {
+                    feedback_label.set_label("Saved settings");
+                    feedback_label.set_visible(true);
+                }
+            }
+        });
+
+        self.asr_use_gpu_switch.connect_active_notify({
+            let updating_settings = self.updating_settings.clone();
+            let feedback_label = self.feedback_label.clone();
+            move |switch| {
+                if updating_settings.get() {
+                    return;
+                }
+                let asr_use_gpu = switch.is_active();
+                if let Err(error) = save_settings_change(move |settings| {
+                    settings.asr_use_gpu = asr_use_gpu;
+                }) {
+                    feedback_label.set_label(&format!("Failed to save settings: {error}"));
+                    feedback_label.set_visible(true);
+                } else {
+                    pepperx_asr::set_asr_use_gpu(asr_use_gpu);
+                    std::thread::Builder::new()
+                        .name("pepperx-asr-warmup".into())
+                        .spawn(|| {
+                            let _ = crate::transcription::prewarm_preferred_asr_model();
+                        })
+                        .ok();
                     feedback_label.set_label("Saved settings");
                     feedback_label.set_visible(true);
                 }
@@ -1539,19 +1579,6 @@ pub fn settings_form_sections(surface_state: &SettingsSurfaceState) -> Vec<Setti
                     active: surface_state.cleanup_enabled,
                 }),
                 SettingsControl::Switch(SettingsSwitchControl {
-                    title: "Use GPU for cleanup".into(),
-                    subtitle: "Offload cleanup model layers to the GPU when available".into(),
-                    active: surface_state.cleanup_use_gpu,
-                }),
-                SettingsControl::Slider(SettingsSliderControl {
-                    title: "GPU layers".into(),
-                    subtitle: "0 uses automatic detection; higher values offload more layers"
-                        .into(),
-                    value: surface_state.cleanup_gpu_layers,
-                    enabled: surface_state.cleanup_enabled && surface_state.cleanup_use_gpu,
-                    visible: surface_state.cleanup_use_gpu,
-                }),
-                SettingsControl::Switch(SettingsSwitchControl {
                     title: "Window context".into(),
                     subtitle:
                         "Capture screen text to help the cleanup model disambiguate names and terms"
@@ -1607,6 +1634,13 @@ pub fn settings_form_sections(surface_state: &SettingsSurfaceState) -> Vec<Setti
         SettingsFormSection {
             title: "Models".into(),
             controls: vec![
+                SettingsControl::Switch(SettingsSwitchControl {
+                    title: "Use GPU for transcription".into(),
+                    subtitle:
+                        "Run the transcription model on the GPU when this build includes CUDA"
+                            .into(),
+                    active: surface_state.asr_use_gpu,
+                }),
                 SettingsControl::Select(SettingsSelectControl {
                     title: "Transcription model".into(),
                     subtitle: "Speech-to-text model for voice input".into(),
@@ -1641,6 +1675,19 @@ pub fn settings_form_sections(surface_state: &SettingsSurfaceState) -> Vec<Setti
                         .map(|m| m.id.to_string())
                         .collect(),
                     enabled: true,
+                }),
+                SettingsControl::Switch(SettingsSwitchControl {
+                    title: "Use GPU for cleanup".into(),
+                    subtitle: "Offload cleanup model layers to the GPU when available".into(),
+                    active: surface_state.cleanup_use_gpu,
+                }),
+                SettingsControl::Slider(SettingsSliderControl {
+                    title: "GPU layers".into(),
+                    subtitle: "0 uses automatic detection; higher values offload more layers"
+                        .into(),
+                    value: surface_state.cleanup_gpu_layers,
+                    enabled: surface_state.cleanup_enabled && surface_state.cleanup_use_gpu,
+                    visible: surface_state.cleanup_use_gpu,
                 }),
             ],
         },

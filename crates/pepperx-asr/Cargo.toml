@@ -7,9 +7,12 @@ publish = false
 [features]
 default = ["cuda"]
 cuda = ["parakeet-rs/cuda"]
+# Opt-in. Links ONNX Runtime as libonnxruntime.so so the CUDA provider can attach.
+ort-dynamic = ["dep:ort", "ort/load-dynamic", "ort/cuda", "ort/download-binaries", "ort/copy-dylibs"]
 
 [dependencies]
 hound = "3.5.1"
+ort = { version = "2.0.0-rc.13", optional = true, default-features = false }
 # 0.3 for multilingual NemotronMode (all-features stack)
 # CUDA is the default feature. CI passes --no-default-features (no nvcc on the runner).
 parakeet-rs = { version = "0.3", default-features = false, features = ["cpu", "ort-defaults"] }

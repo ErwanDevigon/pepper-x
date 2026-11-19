@@ -687,6 +687,7 @@ mod app_shell {
             .build();
         let settings_surface_state = Rc::new(RefCell::new(SettingsSurfaceState {
             cleanup_enabled: true,
+            asr_use_gpu: true,
             cleanup_use_gpu: false,
             cleanup_gpu_layers: 0,
             preferred_asr_model: "nemo-parakeet-tdt-0.6b-v3-int8".into(),
@@ -740,6 +741,7 @@ mod app_shell {
 
         settings_surface_state.replace(SettingsSurfaceState {
             cleanup_enabled: false,
+            asr_use_gpu: true,
             cleanup_use_gpu: false,
             cleanup_gpu_layers: 0,
             preferred_asr_model: "nemo-parakeet-tdt-0.6b-v3-int8".into(),
@@ -787,6 +789,7 @@ mod app_shell {
     fn window_settings_page_scaffold_builds_structured_rows() {
         let scaffold = settings_page_scaffold(&SettingsSurfaceState {
             cleanup_enabled: true,
+            asr_use_gpu: true,
             cleanup_use_gpu: false,
             cleanup_gpu_layers: 0,
             preferred_asr_model: "nemo-parakeet-tdt-0.6b-v3-int8".into(),
@@ -869,29 +872,12 @@ mod app_shell {
             &scaffold.sections[1].controls[1],
             SettingsControl::Switch(SettingsSwitchControl {
                 title,
-                active: false,
-                ..
-            }) if title == "Use GPU for cleanup"
-        ));
-        assert!(matches!(
-            &scaffold.sections[1].controls[2],
-            SettingsControl::Slider(SettingsSliderControl {
-                title,
-                value: 0,
-                visible: false,
-                ..
-            }) if title == "GPU layers"
-        ));
-        assert!(matches!(
-            &scaffold.sections[1].controls[3],
-            SettingsControl::Switch(SettingsSwitchControl {
-                title,
                 active: true,
                 ..
             }) if title == "Window context"
         ));
         assert!(matches!(
-            &scaffold.sections[1].controls[4],
+            &scaffold.sections[1].controls[2],
             SettingsControl::Select(SettingsSelectControl {
                 title,
                 selected,
@@ -902,7 +888,7 @@ mod app_shell {
                 && options == &vec!["ordinary-dictation".to_string(), "literal-dictation".to_string()]
         ));
         assert!(matches!(
-            &scaffold.sections[1].controls[5],
+            &scaffold.sections[1].controls[3],
             SettingsControl::TextArea(SettingsTextAreaControl {
                 title,
                 text,
@@ -937,13 +923,21 @@ mod app_shell {
         // Models page
         assert!(matches!(
             &scaffold.sections[3].controls[0],
+            SettingsControl::Switch(SettingsSwitchControl {
+                title,
+                active: true,
+                ..
+            }) if title == "Use GPU for transcription"
+        ));
+        assert!(matches!(
+            &scaffold.sections[3].controls[1],
             SettingsControl::Select(SettingsSelectControl {
                 title,
                 ..
             }) if title == "Transcription model"
         ));
         assert!(matches!(
-            &scaffold.sections[3].controls[1],
+            &scaffold.sections[3].controls[2],
             SettingsControl::Select(SettingsSelectControl {
                 title,
                 selected,
@@ -952,11 +946,28 @@ mod app_shell {
             }) if title == "Transcription language" && selected == "fr-FR"
         ));
         assert!(matches!(
-            &scaffold.sections[3].controls[2],
+            &scaffold.sections[3].controls[3],
             SettingsControl::Select(SettingsSelectControl {
                 title,
                 ..
             }) if title == "Cleanup model"
+        ));
+        assert!(matches!(
+            &scaffold.sections[3].controls[4],
+            SettingsControl::Switch(SettingsSwitchControl {
+                title,
+                active: false,
+                ..
+            }) if title == "Use GPU for cleanup"
+        ));
+        assert!(matches!(
+            &scaffold.sections[3].controls[5],
+            SettingsControl::Slider(SettingsSliderControl {
+                title,
+                value: 0,
+                visible: false,
+                ..
+            }) if title == "GPU layers"
         ));
 
         // History page (content injected at runtime, scaffold has no controls)
