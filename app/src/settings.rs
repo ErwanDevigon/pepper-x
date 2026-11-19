@@ -27,6 +27,14 @@ fn default_enable_post_paste_learning() -> bool {
     true
 }
 
+fn default_asr_use_gpu() -> bool {
+    false
+}
+
+fn default_cleanup_use_gpu() -> bool {
+    true
+}
+
 fn default_cleanup_gpu_layers() -> u32 {
     0
 }
@@ -131,7 +139,9 @@ pub struct AppSettings {
     pub ignore_other_speakers: bool,
     #[serde(default = "default_enable_post_paste_learning")]
     pub enable_post_paste_learning: bool,
-    #[serde(default)]
+    #[serde(default = "default_asr_use_gpu")]
+    pub asr_use_gpu: bool,
+    #[serde(default = "default_cleanup_use_gpu")]
     pub cleanup_use_gpu: bool,
     #[serde(default = "default_cleanup_gpu_layers")]
     pub cleanup_gpu_layers: u32,
@@ -179,7 +189,8 @@ impl Default for AppSettings {
             toggle_trigger_keys: default_toggle_trigger_keys(),
             ignore_other_speakers: false,
             enable_post_paste_learning: true,
-            cleanup_use_gpu: false,
+            asr_use_gpu: false,
+            cleanup_use_gpu: true,
             cleanup_gpu_layers: 0,
             preferred_trigger_keys: None,
         }

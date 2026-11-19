@@ -11,6 +11,7 @@ path = "src/main.rs"
 [features]
 default = ["cuda"]
 cuda = ["pepperx-asr/cuda"]
+ort-dynamic = ["pepperx-asr/ort-dynamic"]
 
 [dependencies]
 async-channel = "2.5"

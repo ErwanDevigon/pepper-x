@@ -254,6 +254,17 @@ fn asr_force_cpu() -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("cpu"))
 }
 
+static ASR_USE_GPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Runtime switch from Settings. The next TDT load follows it.
+pub fn set_asr_use_gpu(enabled: bool) {
+    ASR_USE_GPU.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn asr_wants_cpu() -> bool {
+    asr_force_cpu() || !ASR_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Load a Parakeet TDT model and keep it for the life of the process.
 /// A Nemotron directory is ignored. A later call with another directory
 /// replaces the cached model.
@@ -268,7 +279,7 @@ pub fn prewarm_parakeet_tdt(model_dir: &Path) -> Result<(), TranscriptionError> 
 fn cached_parakeet_tdt(
     model_dir: &Path,
 ) -> Result<std::sync::MutexGuard<'static, Option<CachedParakeetTdt>>, TranscriptionError> {
-    let force_cpu = asr_force_cpu();
+    let force_cpu = asr_wants_cpu();
     let mut guard = asr_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -295,8 +306,12 @@ fn cached_parakeet_tdt(
 }
 
 fn load_parakeet_tdt(model_dir: &Path) -> Result<(ParakeetTDT, &'static str), TranscriptionError> {
-    if asr_force_cpu() {
-        eprintln!("[Pepper X] ASR execution provider: cpu (PEPPERX_ASR_EP=cpu)");
+    if asr_wants_cpu() {
+        if asr_force_cpu() {
+            eprintln!("[Pepper X] ASR execution provider: cpu (PEPPERX_ASR_EP=cpu)");
+        } else {
+            eprintln!("[Pepper X] ASR execution provider: cpu (settings)");
+        }
     } else if let Some(loaded) = try_load_parakeet_cuda(model_dir) {
         return loaded;
     }
@@ -312,15 +327,26 @@ fn try_load_parakeet_cuda(
     use parakeet_rs::{ExecutionConfig, ExecutionProvider};
     let config = ExecutionConfig::new().with_execution_provider(ExecutionProvider::Cuda);
     match ParakeetTDT::from_pretrained(model_dir, Some(config)) {
-        Ok(model) => {
+        Ok(model) if process_maps_contain("libcudart") => {
             eprintln!("[Pepper X] ASR execution provider: cuda");
             Some(Ok((model, "cuda")))
+        }
+        Ok(_) => {
+            eprintln!("[Pepper X] ASR CUDA session did not load libcudart, falling back to cpu");
+            None
         }
         Err(error) => {
             eprintln!("[Pepper X] ASR CUDA init failed, falling back to cpu: {error}");
             None
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+fn process_maps_contain(needle: &str) -> bool {
+    std::fs::read_to_string("/proc/self/maps")
+        .ok()
+        .is_some_and(|maps| maps.contains(needle))
 }
 
 #[cfg(not(feature = "cuda"))]

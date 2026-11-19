@@ -819,6 +819,7 @@ fn streaming_transcript_or_batch(
 
 pub(crate) fn prewarm_preferred_asr_model() -> Result<(), TranscriptionRunError> {
     let settings = AppSettings::load_or_default();
+    pepperx_asr::set_asr_use_gpu(settings.asr_use_gpu);
     let model_dir = configured_model_dir_for_model_id(&settings.preferred_asr_model)?;
     pepperx_asr::prewarm_parakeet_tdt(&model_dir)?;
     Ok(())

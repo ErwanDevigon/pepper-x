@@ -2,20 +2,18 @@
 
 Local dictation for GNOME on Linux. Hold a shortcut, speak, release. Or load a recording you already made. The text lands in the focused app. Audio and models stay on the machine.
 
-Pepper X started from a strong base: a GNOME app, a local ASR engine, and a small cleanup model. This tree keeps that shape and retunes it for an NVIDIA GPU. The configuration below is the one that currently feels immediate in daily use.
+Pepper X started from a strong base: a GNOME app, a local ASR engine, and a small cleanup model. This tree keeps that shape. The speed that matters is keeping the selected models loaded for the life of the process. A fresh dictation then reuses them instead of loading them again.
 
 ## Recommended setup
 
-Use this if you have an NVIDIA GPU and about 8 GB of VRAM.
+1. **ASR:** `fluid-speech-pro` or `parakeet-ultra`. Both are Parakeet TDT models in ONNX. They run as one pass on the finished recording. Leave **Use GPU for transcription** off. On a cached model the CPU pass is already very short, and this build does not keep those weights on the GPU yet. Turning the switch on asks ONNX Runtime for CUDA, then falls back to CPU when that session does not load. It does not reserve a multi-gigabyte VRAM block.
+2. **Cleanup:** `Qwen3.5-4B-Q4_K_M`, with **Use GPU for cleanup** on and the GPU layers set (100 on a 12 GB card is the setup measured below). This is the real GPU win. 2B is lighter. 9B is slower and not worth it for short dictation. 0.8B is the small CPU-era default and is easy to outgrow.
+3. Leave the TDT model selected. The app loads it at startup and keeps the session for the life of the process. The next dictation reuses it. That cache, not a CUDA provider, is what makes transcription feel immediate.
+4. Quit from the panel menu (**Quit Pepper X**) or with `gapplication action com.obra.PepperX quit`. Warning: Do not suspend the process with Ctrl-Z: it holds an AT-SPI keyboard grab and the session input freezes until the process exits cleanly.
 
-1. **ASR:** `fluid-speech-pro` or `parakeet-ultra`. Both are Parakeet TDT models in ONNX. They run as one pass on the finished recording, on the ONNX Runtime CUDA provider.
-2. **Cleanup:** `Qwen3.5-4B-Q4_K_M`, with **Use GPU for cleanup** on and all layers offloaded. 2B is lighter. 9B is slower and not worth it for short dictation. 0.8B is the small CPU-era default and is easy to outgrow.
-3. Leave the TDT model selected. The app loads it at startup and keeps the session for the life of the process. The next dictation reuses it.
-4. Quit from the panel menu (**Quit Pepper X**) or with `gapplication action com.obra.PepperX quit`. Do not suspend the process with Ctrl-Z: it holds an AT-SPI keyboard grab and the session input freezes until the process exits cleanly.
+Nemotron remains available. It streams audio while you hold the key. The overlay still waits until release, then cleanup, before it inserts text. On the machine below, a cached TDT model felt faster than that streaming path, and the transcript quality was better. Fluid Speech Pro and Parakeet Ultra choose the language from the audio and hide that control. Prefer Nemotron only if you need its multilingual language picker.
 
-Nemotron remains available. It streams audio while you hold the key. The overlay still waits until release, then cleanup, before it inserts text. On the machine below, a cached TDT model felt faster than that streaming path, and the transcript quality was better. Prefer Nemotron only if you need its multilingual language picker. Fluid Speech Pro and Parakeet Ultra choose the language from the audio and hide that control.
-
-`PEPPERX_ASR_EP=cpu` forces the TDT models onto CPU so you can compare. The default tries CUDA, then falls back to CPU if the CUDA session does not load.
+A fresh settings file leaves transcription on CPU and cleanup on the GPU. If **Use GPU for transcription** is on and the CUDA session does not load, the app uses CPU anyway.
 
 ## What it does
 
@@ -37,29 +35,31 @@ The same transcription exists without the window. That command prints the text a
 pepper-x --transcribe-wav-and-cleanup recording.wav
 ```
 
-Fluid Speech Pro and Parakeet Ultra transcribe the whole file in one CUDA pass, then Qwen cleans it. That is the useful case for a long dictaphone note: the encoder dominates, the session is already cached, and you get a clean transcript without sitting through the recording again. Live holds still feel short. A multi-minute file is where the GPU path saves the most time.
+Fluid Speech Pro and Parakeet Ultra transcribe the whole file in one pass, then Qwen cleans it. The useful case for a long dictaphone note is the cached session plus GPU cleanup: you get a clean transcript without sitting through the recording again.
 
 ## Performance
 
 Older notes in this file described Nemotron on CPU, for example `transcribe=0.0s` because streaming overlapped the recording, then about half a second of cleanup. That no longer describes the recommended path.
 
-These figures are from one RTX 3060, Qwen 3.5 4B Q4_K_M at 100 GPU layers, and a TDT model already cached on the ONNX CUDA provider. They are the cleanup step only, logged after the transcript exists. They are not a benchmark suite.
+These figures are from one RTX 3060. Qwen 3.5 4B Q4_K_M had 100 GPU layers. The TDT model was already cached in RAM. The table is the cleanup step only, logged after the transcript exists. It is not a benchmark suite.
 
-| Dictation length | Cleanup | Model |
+| Dictation length | Cleanup on GPU | Notes |
 | --- | --- | --- |
-| 18–35 characters | 140–210 ms | Fluid Speech Pro, cached CUDA |
-| ~60–80 characters | 230–360 ms | Fluid or Parakeet Ultra, cached CUDA |
-| ~120–150 characters | 460–590 ms | Fluid Speech Pro, cached CUDA |
-| 243 characters | 822 ms | Parakeet Ultra, cached CUDA |
-| 455 characters | 1.5 s | Parakeet Ultra, cached CUDA |
+| 18–35 characters | 140–210 ms | Fluid Speech Pro already cached in RAM |
+| ~60–80 characters | 230–360 ms | Fluid or Parakeet Ultra |
+| ~120–150 characters | 460–590 ms | Fluid Speech Pro |
+| 243 characters | 822 ms | Parakeet Ultra |
+| 455 characters | 1.5 s | Parakeet Ultra |
+
+The same 4B model on CPU, for a 29-character line, took about 3.8 s, of which about 2.1 s was decode. On GPU the decode of a short answer was about 12–27 ms. That is why cleanup stays on the GPU by default.
 
 The cleanup prompt prefill is about 230–250 ms at the start of a hold, on a model that is already resident (about 3.3 GiB of VRAM for the 4B). Short answers often change the text by only a character or two.
 
 Memory, same session:
 
-- **Qwen 3.5 4B** stays on the GPU. `nvidia-smi` shows it on `pepperx-cleanup-helper`, about 3.3 GiB.
-- **Fluid Speech Pro** stays in the `pepper-x` process, about 2.6 GiB of RAM. Persistent VRAM for that process was about 20 MiB. CUDA still runs the forward pass; the weights are not parked in VRAM between dictations. Parakeet Ultra behaves the same way.
-- The first load logs `ASR execution provider: cuda` and `ASR model cached (cuda)`. Later holds log `ASR reusing cached model (cuda)`.
+- **Qwen 3.5 4B** stays on the GPU when **Use GPU for cleanup** is on. `nvidia-smi` shows it on `pepperx-cleanup-helper`, about 3.3 GiB. That block is the expensive one, and it is the one that pays for itself.
+- **Fluid Speech Pro** stays in the `pepper-x` process, about 2.6 GiB of RAM. With the transcription switch off, that process does not hold the model on the GPU. Parakeet Ultra behaves the same way. A log line that says `cuda` only means the app asked for the CUDA provider. Check `nvidia-smi` for a real allocation.
+- The first load logs `ASR model cached`. Later holds log `ASR reusing cached model`. The provider in parentheses is `cpu` or `cuda`.
 
 ## Models
 
@@ -67,11 +67,11 @@ Launch the app, open **Models**, and download anything missing. The catalog ids 
 
 | Role | Id | Notes |
 | --- | --- | --- |
-| ASR | `fluid-speech-pro` | TDT ONNX, ~2.6 GB encoder, batch, CUDA when the provider loads |
+| ASR | `fluid-speech-pro` | TDT ONNX, ~2.6 GB encoder, batch, CPU by default |
 | ASR | `parakeet-ultra` | TDT ONNX, ~2.4 GB, same runtime path as Fluid |
 | ASR | Nemotron 0.6B int8 | ~850 MB, streaming, CPU in this build |
 | ASR | Nemotron 3.5 multilingual int8 | Streaming, language dropdown (`fr-FR` default, or `auto`) |
-| Cleanup | `qwen3.5-4b-q4_k_m.gguf` | Recommended with GPU layers |
+| Cleanup | `qwen3.5-4b-q4_k_m.gguf` | Recommended, GPU on by default |
 | Cleanup | `qwen3.5-2b-q4_k_m.gguf` | ~1.3 GB, faster, lighter |
 | Cleanup | `qwen3.5-9b-q4_k_m.gguf` | ~5.3 GB, slower on short dictation |
 | Cleanup | `qwen3.5-0.8b-q4_k_m.gguf` | ~500 MB |
@@ -162,9 +162,9 @@ The helper reads the active XKB layout (not a hard-coded US map): `PEPPERX_XKB_L
 ### Settings
 
 - **Recording** — hold shortcut, toggle shortcut, microphone, sounds, speaker filter, test dictation.
-- **Cleanup** — on/off, GPU layers, widget context, prompt profile, custom prompt.
+- **Cleanup** — on/off, widget context, prompt profile, custom prompt. **Enable cleanup** stays on this page.
 - **Corrections** — preferred spellings and mishear replacements.
-- **Models** — ASR and cleanup choice, downloads, language dropdown for multilingual Nemotron only.
+- **Models** — **Use GPU for transcription** (off by default), transcription model, language dropdown for multilingual Nemotron only, cleanup model, **Use GPU for cleanup** (on by default), then GPU layers. There is no layer count for the transcription model.
 - **History** — replay a recording with other models, edit the prompt, diff, playback.
 - **General** — launch at login.
 - **Diagnostics** — runtime status.
