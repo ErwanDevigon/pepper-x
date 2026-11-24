@@ -4,10 +4,11 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::mem;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 // Linux input event constants
 const EV_KEY: u16 = 0x01;
@@ -653,6 +654,60 @@ fn classify_device_read(epoll_events: u32, read: io::Result<usize>) -> CapturedR
     }
 }
 
+const KEYBOARD_RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+struct WatchedKeyboard {
+    path: PathBuf,
+    file: File,
+}
+
+/// Keyboards present in `found` that are not already in the capture set.
+fn newly_attached_keyboards(open: &[Option<WatchedKeyboard>], found: &[PathBuf]) -> Vec<PathBuf> {
+    found
+        .iter()
+        .filter(|path| {
+            !open
+                .iter()
+                .flatten()
+                .any(|keyboard| keyboard.path == **path)
+        })
+        .cloned()
+        .collect()
+}
+
+fn open_keyboard(path: &Path) -> io::Result<File> {
+    let file = File::open(path)?;
+    set_nonblocking(&file)?;
+    Ok(file)
+}
+
+fn add_keyboard(epoll_fd: i32, files: &mut Vec<Option<WatchedKeyboard>>, path: PathBuf) -> bool {
+    let file = match open_keyboard(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("[Pepper X] evdev: skipping {}: {error}", path.display());
+            return false;
+        }
+    };
+    let mut event = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: files.len() as u64,
+    };
+    unsafe {
+        if libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, file.as_raw_fd(), &mut event) < 0 {
+            eprintln!(
+                "[Pepper X] evdev: epoll_ctl failed for {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            );
+            return false;
+        }
+    }
+    eprintln!("[Pepper X] evdev: watching {}", path.display());
+    files.push(Some(WatchedKeyboard { path, file }));
+    true
+}
+
 fn set_nonblocking(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -678,46 +733,9 @@ fn run_capture_loop(
         return Err(io::Error::last_os_error());
     }
 
-    let mut files: Vec<Option<File>> = Vec::new();
+    let mut files: Vec<Option<WatchedKeyboard>> = Vec::new();
     for path in device_paths {
-        let file = match File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("[Pepper X] evdev: skipping {}: {e}", path.display());
-                continue;
-            }
-        };
-        if let Err(e) = set_nonblocking(&file) {
-            eprintln!(
-                "[Pepper X] evdev: skipping {} (nonblocking): {e}",
-                path.display()
-            );
-            continue;
-        }
-
-        let mut event = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: files.len() as u64,
-        };
-        unsafe {
-            if libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, file.as_raw_fd(), &mut event) < 0 {
-                eprintln!(
-                    "[Pepper X] evdev: epoll_ctl failed for {}: {}",
-                    path.display(),
-                    io::Error::last_os_error()
-                );
-                continue;
-            }
-        }
-        files.push(Some(file));
-    }
-
-    if files.is_empty() {
-        unsafe { libc::close(epoll_fd) };
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no keyboard devices could be opened",
-        ));
+        add_keyboard(epoll_fd, &mut files, path.clone());
     }
 
     let hold_state = Mutex::new(ModifierHoldState::new(
@@ -732,6 +750,7 @@ fn run_capture_loop(
     let mut current_toggle_config = toggle_config;
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
     let mut buf = [0u8; INPUT_EVENT_SIZE * 16];
+    let mut last_rescan = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         let nfds =
@@ -770,7 +789,7 @@ fn run_capture_loop(
                 continue;
             };
 
-            let captured = classify_device_read(event.events, file.read(&mut buf));
+            let captured = classify_device_read(event.events, file.file.read(&mut buf));
             if captured.drop_device {
                 drop_device.push(file_idx);
             }
@@ -837,19 +856,20 @@ fn run_capture_loop(
                     libc::epoll_ctl(
                         epoll_fd,
                         libc::EPOLL_CTL_DEL,
-                        file.as_raw_fd(),
+                        file.file.as_raw_fd(),
                         std::ptr::null_mut(),
                     );
                 }
-                eprintln!("[Pepper X] evdev: dropped closed keyboard fd {file_idx}");
+                eprintln!("[Pepper X] evdev: dropped {}", file.path.display());
             }
         }
-        if files.iter().all(|slot| slot.is_none()) {
-            unsafe { libc::close(epoll_fd) };
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "all keyboard devices closed",
-            ));
+        if last_rescan.elapsed() >= KEYBOARD_RESCAN_INTERVAL {
+            last_rescan = Instant::now();
+            if let Ok(found) = find_keyboard_devices() {
+                for path in newly_attached_keyboards(&files, &found) {
+                    add_keyboard(epoll_fd, &mut files, path);
+                }
+            }
         }
     }
 
@@ -1254,5 +1274,24 @@ mod tests {
         let live = classify_device_read(readable, Ok(INPUT_EVENT_SIZE));
         assert!(!live.drop_device);
         assert_eq!(live.byte_count, INPUT_EVENT_SIZE);
+    }
+
+    #[test]
+    fn rescan_adds_only_keyboards_missing_from_the_capture_set() {
+        let open = vec![Some(WatchedKeyboard {
+            path: PathBuf::from("/dev/input/event1"),
+            file: File::open("/dev/null").unwrap(),
+        })];
+        let found = vec![
+            PathBuf::from("/dev/input/event1"),
+            PathBuf::from("/dev/input/event4"),
+        ];
+        assert_eq!(
+            newly_attached_keyboards(&open, &found),
+            vec![PathBuf::from("/dev/input/event4")]
+        );
+
+        let gone: Vec<Option<WatchedKeyboard>> = vec![None];
+        assert_eq!(newly_attached_keyboards(&gone, &found), found);
     }
 }
